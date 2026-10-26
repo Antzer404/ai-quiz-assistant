@@ -1,4 +1,4 @@
-# AI 自动答题助手（自定义版 v2）
+# AI 自动答题助手（自定义版 v1.0）
 
 在原项目 [rehuan/AI-ANSWER-ASSISTANT](https://github.com/rehuan/AI-ANSWER-ASSISTANT) 基础上重构的浏览器扩展。
 
