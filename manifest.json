@@ -1,13 +1,12 @@
 {
   "manifest_version": 3,
-  "name": "AI自动答题助手",
-  "version": "1.0.0",
-  "description": "智能识别网页题目，通过AI自动答题",
+  "name": "AI 自动答题助手（自定义版）",
+  "version": "2.0.0",
+  "description": "识别网页题目，使用你自己配置的 OpenAI 兼容模型答题，支持自动下一题",
   "permissions": [
     "activeTab",
     "storage",
     "scripting",
-    "declarativeNetRequest",
     "sidePanel"
   ],
   "host_permissions": ["<all_urls>"],
@@ -29,6 +28,8 @@
     {
       "matches": ["<all_urls>"],
       "js": [
+        "modules/settings.js",
+        "modules/navigation.js",
         "modules/site-matcher.js",
         "modules/template-manager.js",
         "modules/scanner-enhanced.js",

@@ -1,13 +1,44 @@
+// 修改自 rehuan/AI-ANSWER-ASSISTANT（GPL-3.0），修改日期：2026-10-26
 // Content Script - 题目识别和自动答题
 
 (function () {
   "use strict";
 
+  // 防止程序化注入时重复初始化（重复监听、重复自动恢复）
+  if (window.__aiQuizAssistantLoaded) {
+    console.log("[AI答题助手] 已加载，跳过重复初始化");
+    return;
+  }
+  window.__aiQuizAssistantLoaded = true;
+
   // State
   let questions = [];
   let answeredCount = 0;
+  let totalAnswered = 0;
   let isRunning = false;
+  let runFinished = false;
   let config = null;
+  let settings = window.QuizSettings
+    ? window.QuizSettings.normalize()
+    : {
+        autoNext: true,
+        nextMode: "auto",
+        questionDelay: 800,
+        pageDelay: 2000,
+        maxPages: 50,
+        maxRunMinutes: 30,
+        requireAllAnswered: true,
+        skipOnError: true,
+        maxRetries: 1,
+        nextText: ["下一题", "下一页", "继续", "下一步", "Next", "Continue"],
+        submitText: ["提交", "交卷", "完成", "Submit"],
+        nextSelector: "",
+        submitSelector: "",
+        resumeWaitMs: 2500,
+        autoSubmit: false,
+      };
+  let sessionState = null;
+  let lastPage = 1;
 
   // Question selectors for common exam platforms
   const QUESTION_SELECTORS = [
@@ -64,101 +95,142 @@
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.action) {
       case "scan":
-        config = message.config;
+        config = message.config || null;
+        settings = normalizeSettings(message.settings);
         handleScan(sendResponse);
         return true; // 保持消息通道开放用于异步响应
+
       case "start":
-        config = message.config;
+        config = message.config || null;
+        settings = normalizeSettings(message.settings);
+        if (!config) {
+          sendResponse({ success: false, error: "请先配置模型" });
+          return true;
+        }
+        if (isRunning) {
+          sendResponse({ success: true, alreadyRunning: true });
+          return true;
+        }
         startAnswering();
         sendResponse({ success: true });
-        break;
+        return true;
+
       case "stop":
         stopAnswering();
         sendResponse({ success: true });
-        break;
+        return true;
+
       case "getStatus":
         sendResponse({
           questionCount: questions.length,
-          answeredCount,
+          answeredCount: totalAnswered,
+          pageAnsweredCount: answeredCount,
           isRunning,
+          page: sessionState ? sessionState.page : lastPage,
         });
         break;
     }
     return true;
   });
 
-  // 处理扫描请求
+  function normalizeSettings(raw) {
+    return window.QuizSettings
+      ? window.QuizSettings.normalize(raw)
+      : raw || settings;
+  }
+
+  // 处理扫描请求（手动扫描）
   async function handleScan(sendResponse) {
-    if (!config) {
-      sendResponse({ success: false, count: 0, message: "请先配置API" });
+    if (isRunning) {
+      sendResponse({
+        success: false,
+        count: 0,
+        message: "答题进行中，请先停止再重新扫描",
+      });
       return;
     }
 
-    // 步骤1: 尝试匹配站点模板
+    totalAnswered = 0;
+    sessionState = null;
+    lastPage = 1;
+
+    try {
+      const count = await performScan();
+      if (count > 0) {
+        sendResponse({ success: true, count, message: "" });
+      } else {
+        sendResponse({ success: false, count: 0, message: "未发现题目" });
+      }
+    } catch (error) {
+      sendLog("error", `扫描失败: ${error.message}`);
+      sendResponse({ success: false, count: 0, message: error.message });
+    }
+  }
+
+  // 扫描当前页面：模板优先，失败后回退到 AI
+  async function performScan() {
+    questions = [];
+    answeredCount = 0;
+    updateStats();
+
     sendLog("info", "正在匹配站点模板...");
-    const template = window.siteMatcher.matchTemplate(window.location.href);
+
+    let template = null;
+    try {
+      template = window.siteMatcher
+        ? window.siteMatcher.matchTemplate(window.location.href)
+        : null;
+    } catch (error) {
+      console.warn("[AI答题助手] 模板匹配失败:", error);
+    }
 
     if (template) {
       sendLog("info", `已匹配到站点模板: ${template.siteName}`);
-
       try {
-        // 使用模板扫描
         const scanner = new window.EnhancedScanner();
         const result = scanner.scanWithTemplate(template);
 
         if (result.success && result.count > 0) {
-          // 模板扫描成功
           questions = result.questions;
-          answeredCount = 0;
           updateStats();
-
           sendLog("success", `使用模板扫描成功，发现 ${result.count} 道题目`);
-
-          // 更新模板统计
-          await window.templateManager.updateStats(template.siteId, "success");
-
-          sendResponse({ success: true, count: result.count, message: "" });
-          return;
-        } else {
-          // 模板扫描失败，回退到AI分析
-          sendLog("warning", `模板扫描失败，回退到AI分析...`);
-          await window.templateManager.updateStats(template.siteId, "fail");
+          return result.count;
         }
+        sendLog("warning", "模板扫描失败，回退到AI分析...");
       } catch (error) {
         sendLog("error", `模板扫描出错: ${error.message}，回退到AI分析`);
-        await window.templateManager.updateStats(template.siteId, "fail");
       }
     } else {
       sendLog("info", "未找到匹配的站点模板，使用AI分析...");
     }
 
-    // 步骤2: 使用AI分析（无模板或模板失败时）
-    sendLog("info", "正在使用AI分析页面结构，请耐心等待...");
+    if (!config || !config.baseUrl || !config.apiKey || !config.model) {
+      sendLog("warning", "未配置 AI 模型，无法进行 AI 分析");
+      updateStats();
+      return 0;
+    }
 
+    sendLog("info", "正在使用AI分析页面结构，请耐心等待...");
     try {
       const aiResult = await analyzePageWithAI();
       if (aiResult && aiResult.success) {
         aiDetectedSelectors = aiResult.selectors;
         const count = scanWithAISelectors(aiResult);
         if (count > 0) {
+          updateStats();
           sendLog("success", `AI分析成功，发现 ${count} 道题目`);
-          sendResponse({ success: true, count, message: "" });
-        } else {
-          sendLog("warning", "AI分析完成，但未能定位到题目元素");
-          sendResponse({
-            success: false,
-            count: 0,
-            message: "未能定位到题目元素",
-          });
+          return count;
         }
+        sendLog("warning", "AI分析完成，但未能定位到题目元素");
       } else {
         sendLog("warning", "AI分析未发现题目");
-        sendResponse({ success: false, count: 0, message: "未发现题目" });
       }
     } catch (error) {
       sendLog("error", `AI分析失败: ${error.message}`);
-      sendResponse({ success: false, count: 0, message: error.message });
     }
+
+    updateStats();
+    return 0;
   }
 
   // Scan for questions on the page
@@ -589,33 +661,16 @@ ${contentIntro}
 HTML内容：
 ${payload}`;
 
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(
-        {
-          action: "analyzeHTML",
-          config,
-          prompt,
-        },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
-          }
+    const response = await bgSend({ action: "analyzeHTML", config, prompt });
+    if (!response.success) {
+      throw new Error(response.error || "AI 分析请求失败");
+    }
 
-          if (!response.success) {
-            reject(new Error(response.error));
-            return;
-          }
-
-          try {
-            const result = parseAIResponse(response.data);
-            resolve(result);
-          } catch (e) {
-            reject(new Error("解析AI响应失败: " + e.message));
-          }
-        }
-      );
-    });
+    try {
+      return parseAIResponse(response.data);
+    } catch (error) {
+      throw new Error(`解析AI响应失败: ${error.message}`);
+    }
   }
 
   // 使用AI分析结果创建题目列表（不含答案，答案在答题阶段逐题获取）
@@ -701,100 +756,566 @@ ${payload}`;
   }
 
   // Start answering questions
+  // -------------------------------------------------------------------------
+  // 答题会话：当前页答题 -> 自动下一题 -> 重新扫描 -> 继续
+  // -------------------------------------------------------------------------
+
   async function startAnswering() {
     if (isRunning) return;
-
-    isRunning = true;
-
-    if (questions.length === 0) {
-      sendLog("warning", "请先扫描题目");
-      isRunning = false;
-      sendComplete();
+    if (!config) {
+      sendLog("error", "请先配置模型");
       return;
     }
 
-    sendLog("info", `开始答题，共 ${questions.length} 道题目`);
+    isRunning = true;
+    runFinished = false;
+    totalAnswered = 0;
+    answeredCount = 0;
+    sessionState = null;
+    lastPage = 1;
 
-    for (let i = 0; i < questions.length; i++) {
-      if (!isRunning) {
-        sendLog("warning", "答题已停止");
+    // 允许在同一页面重新开始：重置本页的已答标记
+    questions.forEach((question) => {
+      question.answered = false;
+    });
+    updateStats();
+
+    sendLog("info", "🚀 开始自动答题");
+
+    const res = await bgSend({
+      action: "sessionStart",
+      config,
+      settings,
+      startUrl: location.href,
+      origin: location.origin,
+      answeredTotal: 0,
+    });
+
+    if (res && res.success && res.state) {
+      sessionState = res.state;
+    } else {
+      sendLog(
+        "warning",
+        `会话状态保存失败，本次仍可继续，但跨页恢复可能不可用${
+          res && res.error ? `：${res.error}` : ""
+        }`
+      );
+    }
+
+    try {
+      await runSession({ resumed: false });
+    } catch (error) {
+      sendLog("error", `运行出错: ${error.message}`);
+      await finishRun({ stopped: true, reason: error.message });
+    }
+  }
+
+  async function runSession({ resumed }) {
+    const startedAt =
+      (sessionState && sessionState.startedAt) || Date.now();
+    const maxRunMs = Math.max(1, settings.maxRunMinutes) * 60 * 1000;
+    let reason = "";
+    let stopped = !isRunning;
+
+    try {
+      while (isRunning) {
+        if (Date.now() - startedAt > maxRunMs) {
+          reason = "已达到最大运行时间，自动停止";
+          break;
+        }
+
+        if (
+          window.QuizNavigation &&
+          window.QuizNavigation.detectChallenge()
+        ) {
+          reason = "检测到验证码/人机验证，已停止";
+          break;
+        }
+
+        if (questions.length === 0) {
+          const count = await performScan();
+          if (count === 0) {
+            reason = "未发现题目，已停止";
+            break;
+          }
+        }
+
+        await answerCurrentPage();
+
+        if (!isRunning) {
+          reason = "已手动停止";
+          break;
+        }
+
+        const unanswered = questions.filter((q) => !q.answered).length;
+        if (settings.requireAllAnswered && unanswered > 0) {
+          reason = `还有 ${unanswered} 题未完成，已停止自动翻页`;
+          break;
+        }
+
+        if (!settings.autoNext) {
+          reason = "自动下一题已关闭";
+          break;
+        }
+
+        if (settings.nextMode === "scroll") {
+          reason = "同页滚动模式已完成当前页";
+          break;
+        }
+
+        const nextPage = (Number(sessionState && sessionState.page) || 1) + 1;
+        const advanced = await tryAdvance(nextPage);
+        if (!advanced) {
+          reason = "没有可用的下一题/下一页，任务结束";
+          break;
+        }
+
+        sendLog("info", `等待第 ${nextPage} 页加载...`);
+        await sleep(withJitter(settings.pageDelay));
+
+        if (!isRunning) {
+          reason = "已手动停止";
+          break;
+        }
+
+        questions = [];
+        answeredCount = 0;
+        updateStats();
+
+        const count = await performScan();
+        if (count === 0) {
+          reason = "翻页后未发现题目，已停止";
+          break;
+        }
+      }
+    } catch (error) {
+      reason = `运行出错: ${error.message}`;
+      stopped = true;
+      sendLog("error", reason);
+    } finally {
+      await finishRun({ stopped: stopped || !isRunning, reason });
+    }
+  }
+
+  async function answerCurrentPage() {
+    const pending = questions.filter((q) => !q.answered);
+    if (pending.length === 0) return;
+
+    sendLog(
+      "info",
+      `当前页共 ${questions.length} 题，待答 ${pending.length} 题`
+    );
+
+    for (const question of pending) {
+      if (!isRunning) break;
+
+      if (
+        window.QuizNavigation &&
+        window.QuizNavigation.detectChallenge()
+      ) {
+        sendLog("warning", "检测到验证码/人机验证，暂停答题");
         break;
       }
 
-      const question = questions[i];
-
-      if (question.answered) {
-        continue;
-      }
-
-      // 找到第一个有效的选项元素用于滚动定位和高亮
+      const displayIndex = questions.indexOf(question) + 1;
       const firstElement = findFirstValidElement(question);
 
       if (firstElement) {
-        // 滚动到题目位置
         scrollToElement(firstElement);
-        await sleep(300);
-
-        // 高亮当前题目区域
-        const questionContainer = findQuestionContainer(firstElement);
-        if (questionContainer) {
-          highlightElement(questionContainer);
-        }
+        await sleep(200);
+        const container = findQuestionContainer(firstElement);
+        if (container) highlightElement(container);
       }
 
       sendLog(
         "info",
-        `正在处理第 ${i + 1}/${questions.length} 题: ${question.text.substring(
-          0,
-          30
-        )}...`
+        `正在获取第 ${displayIndex}/${questions.length} 题的答案...`
       );
 
-      try {
-        // 逐题调用AI获取答案
-        sendLog("info", `正在获取第 ${i + 1} 题的答案...`);
-        const answer = await getAIAnswerForQuestion(question);
+      let answer = null;
+      let lastError = null;
 
-        if (answer && answer.answer) {
-          question.answer = answer.answer;
-          question.explanation = answer.explanation;
+      for (let attempt = 0; attempt <= settings.maxRetries; attempt += 1) {
+        if (!isRunning) break;
+        try {
+          const hint =
+            attempt > 0
+              ? "上一次返回的答案无法匹配题目选项。请只返回有效选项字母，并严格输出 JSON。"
+              : "";
+          const raw = await getAIAnswerForQuestion(question, hint);
+          if (!isRunning) break;
+          answer = normalizeAnswerForQuestion(question, raw);
+          if (answer) break;
+          lastError = new Error("AI 返回的答案格式无效");
+        } catch (error) {
+          lastError = error;
+        }
+
+        if (attempt < settings.maxRetries) {
+          sendLog(
+            "warning",
+            `第 ${displayIndex} 题获取答案失败，重试 ${attempt + 1}/${
+              settings.maxRetries
+            }：${lastError ? lastError.message : "未知错误"}`
+          );
+          await sleep(800 * (attempt + 1));
+        }
+      }
+
+      // 用户在 AI 请求期间点击了停止：不要继续应用答案
+      if (!isRunning) break;
+
+      if (answer) {
+        question.answer = answer.answer;
+        question.explanation = answer.explanation || "";
+        try {
           await applyAnswerDirectly(question);
           question.answered = true;
-          answeredCount++;
+          answeredCount += 1;
+          totalAnswered += 1;
           updateStats();
-          // 发送统计
-          chrome.runtime.sendMessage({
-            action: "trackStats",
-            event: "question_answered",
+          await updateSession({
+            phase: "answering",
+            answeredTotal: totalAnswered,
+            lastUrl: location.href,
           });
           sendLog(
             "success",
-            `第 ${i + 1} 题已完成，答案: ${JSON.stringify(question.answer)}`
+            `第 ${displayIndex} 题已完成，答案: ${JSON.stringify(
+              question.answer
+            )}`
           );
-        } else {
-          sendLog("warning", `第 ${i + 1} 题未能获取答案`);
+        } catch (error) {
+          lastError = error;
+          sendLog(
+            "error",
+            `第 ${displayIndex} 题填写失败: ${error.message}`
+          );
         }
-      } catch (error) {
-        sendLog("error", `第 ${i + 1} 题处理失败: ${error.message}`);
-        console.error("[AI答题助手] 答题错误:", error);
       }
 
-      // 移除高亮
+      if (!question.answered) {
+        sendLog(
+          "warning",
+          `第 ${displayIndex} 题未能完成${
+            lastError ? `：${lastError.message}` : ""
+          }`
+        );
+        if (!settings.skipOnError) {
+          sendLog("error", "按设置停止答题");
+          isRunning = false;
+        }
+      }
+
       if (firstElement) {
-        const questionContainer = findQuestionContainer(firstElement);
-        if (questionContainer) {
-          removeHighlight(questionContainer);
-          // 添加已完成标记
-          markAsCompleted(questionContainer);
+        const container = findQuestionContainer(firstElement);
+        if (container) {
+          removeHighlight(container);
+          markAsCompleted(container);
         }
       }
 
-      // Wait before next question
-      await sleep(500);
+      if (!isRunning) break;
+      await sleep(withJitter(settings.questionDelay));
+    }
+  }
+
+  async function tryAdvance(nextPage) {
+    if (!window.QuizNavigation) return false;
+
+    const control = window.QuizNavigation.findNextControl(document, settings);
+    if (!control || !control.element) {
+      sendLog("info", "未找到“下一题/下一页”按钮");
+      return false;
     }
 
+    const text = control.text || "";
+    const submitKeywords = settings.submitText || [];
+    const looksLikeSubmit =
+      control.type === "submit" ||
+      submitKeywords.some((keyword) =>
+        String(text).toLowerCase().includes(String(keyword).toLowerCase())
+      );
+
+    if (looksLikeSubmit) {
+      sendLog(
+        "info",
+        `已到最后一页（检测到“${text || "提交"}”按钮），按设置不自动提交。请检查后手动提交。`
+      );
+      return false;
+    }
+
+    if (nextPage > Number(settings.maxPages)) {
+      sendLog("info", `已达到最大页数（${settings.maxPages}），已停止`);
+      return false;
+    }
+
+    // 在点击前保存页码：整页刷新的站点上，旧页面会在点击后立即销毁
+    lastPage = nextPage;
+    if (sessionState) sessionState.page = nextPage;
+
+    const previousSignature = window.QuizNavigation.getPageSignature();
+    await updateSession({
+      phase: "navigating",
+      page: nextPage,
+      lastUrl: location.href,
+    });
+    sendLog("info", `点击“${text || "下一题"}”翻页...`);
+
+    // 先使用原生 click，兼容大多数站点
+    try {
+      control.element.click();
+    } catch (_) {
+      await clickElement(control.element);
+    }
+
+    let changed = await window.QuizNavigation.waitForChange(
+      previousSignature,
+      Math.max(8000, settings.pageDelay + 5000),
+      200
+    );
+
+    // 某些站点只监听 mousedown/mouseup
+    if (!changed && isRunning) {
+      await clickElement(control.element);
+      changed = await window.QuizNavigation.waitForChange(
+        previousSignature,
+        Math.max(5000, settings.pageDelay + 3000),
+        200
+      );
+    }
+
+    if (!changed) {
+      sendLog(
+        "warning",
+        "点击后页面没有变化。可能是按钮选择错误、页面被拦截，或需要手动处理。"
+      );
+    }
+
+    return changed;
+  }
+
+  async function finishRun({ stopped, reason }) {
+    if (runFinished) return;
+    runFinished = true;
+
     isRunning = false;
-    sendComplete();
+    if (reason) sendLog(stopped ? "warning" : "info", reason);
+
+    try {
+      await bgSend({ action: "sessionClear" });
+    } catch (_) {
+      /* ignore */
+    }
+
+    sessionState = null;
+    updateStats();
+    sendComplete(Boolean(stopped));
+  }
+
+  // 页面加载后自动恢复未完成的会话（分页整页刷新时使用）
+  async function resumeRunIfNeeded() {
+    const res = await bgSend({ action: "sessionGet" });
+    const state = res && res.state;
+
+    if (!state || !state.running || state.stopRequested) return;
+    if (state.expiresAt && Date.now() > state.expiresAt) {
+      await bgSend({ action: "sessionClear" });
+      return;
+    }
+    if (!state.config || !state.config.baseUrl) return;
+
+    if (state.origin && state.origin !== location.origin) {
+      sendLog("warning", "页面已跳转到其他站点，停止自动恢复");
+      await bgSend({ action: "sessionClear" });
+      return;
+    }
+
+    config = state.config;
+    settings = normalizeSettings(state.settings);
+    sessionState = state;
+    totalAnswered = Number(state.answeredTotal) || 0;
+    lastPage = Number(state.page) || 1;
+    isRunning = true;
+    runFinished = false;
+
+    sendLog(
+      "info",
+      `检测到未完成的答题任务（第 ${state.page || 1} 页），等待页面加载后继续...`
+    );
+
+    await waitForQuestionDOM(Math.max(500, settings.resumeWaitMs));
+    if (!isRunning) return;
+
+    if (
+      window.QuizNavigation &&
+      window.QuizNavigation.detectChallenge()
+    ) {
+      sendLog("warning", "检测到验证码/人机验证，停止自动恢复");
+      isRunning = false;
+      await finishRun({ stopped: true, reason: "需要人工完成验证" });
+      return;
+    }
+
+    await runSession({ resumed: true });
+  }
+
+  async function waitForQuestionDOM(timeoutMs) {
+    const startedAt = Date.now();
+    const selector =
+      'input, textarea, select, [contenteditable="true"], [class*="question"], [class*="topic"]';
+    while (Date.now() - startedAt < timeoutMs) {
+      try {
+        if (document.querySelector(selector)) return true;
+      } catch (_) {
+        /* ignore */
+      }
+      await sleep(200);
+    }
+    return false;
+  }
+
+  function normalizeAnswerForQuestion(question, answer) {
+    if (!answer || answer.answer === undefined || answer.answer === null) {
+      return null;
+    }
+
+    if (question.type === "single") {
+      const options = question.options || [];
+      const raw = String(answer.answer).trim();
+      const letterMatch = raw.match(/[A-Za-z]/);
+      if (letterMatch) {
+        const letter = letterMatch[0].toUpperCase();
+        if (
+          options.length === 0 ||
+          options.some(
+            (opt) => String(opt.label).toUpperCase() === letter
+          )
+        ) {
+          return { ...answer, answer: letter };
+        }
+      }
+      const matched = options.find(
+        (opt) =>
+          cleanText(opt.text || "").toLowerCase() === raw.toLowerCase()
+      );
+      if (matched) {
+        return { ...answer, answer: String(matched.label).toUpperCase() };
+      }
+      return null;
+    }
+
+    if (question.type === "multiple") {
+      const options = question.options || [];
+      const raw = answer.answer;
+      const items = Array.isArray(raw)
+        ? raw.map((item) => String(item).trim()).filter(Boolean)
+        : String(raw)
+            .split(/[,，、;；\n]+/)
+            .map((item) => item.trim())
+            .filter(Boolean);
+
+      let letters = [];
+
+      for (const item of items) {
+        // "B", "B. 选项内容", "B、选项内容"
+        const prefixed = item.match(/^([A-Za-z])(?=[.、:：)\s]|$)/);
+        if (prefixed) {
+          letters.push(prefixed[1].toUpperCase());
+          continue;
+        }
+        if (/^[A-Za-z]$/.test(item)) {
+          letters.push(item.toUpperCase());
+          continue;
+        }
+        // 模型直接返回选项文本
+        const matched = options.find(
+          (opt) =>
+            cleanText(opt.text || "").toLowerCase() === item.toLowerCase()
+        );
+        if (matched) {
+          letters.push(String(matched.label).toUpperCase());
+        }
+      }
+
+      // 兜底："AC" 这种没有分隔符的字母串
+      if (letters.length === 0 && typeof raw === "string") {
+        letters = (raw.match(/[A-Za-z]/g) || []).map((item) =>
+          item.toUpperCase()
+        );
+      }
+
+      letters = Array.from(new Set(letters)).filter((letter) => {
+        if (options.length === 0) return /^[A-Z]$/.test(letter);
+        return options.some(
+          (opt) => String(opt.label).toUpperCase() === letter
+        );
+      });
+
+      if (letters.length === 0) return null;
+      return { ...answer, answer: letters };
+    }
+
+    if (question.type === "fill") {
+      let values = Array.isArray(answer.answer)
+        ? answer.answer
+        : [answer.answer];
+
+      // 多个空但模型只返回了一个用分号分隔的字符串
+      if (
+        values.length === 1 &&
+        question.inputs &&
+        question.inputs.length > 1 &&
+        typeof values[0] === "string"
+      ) {
+        const parts = values[0]
+          .split(/[；;\n]+/)
+          .map((value) => value.trim())
+          .filter(Boolean);
+        if (parts.length > 1) values = parts;
+      }
+
+      const cleaned = values
+        .map((value) =>
+          String(value === undefined || value === null ? "" : value).trim()
+        )
+        .filter(Boolean);
+      if (cleaned.length === 0) return null;
+      return { ...answer, answer: cleaned };
+    }
+
+    return answer;
+  }
+
+  function withJitter(ms) {
+    const base = Math.max(0, Number(ms) || 0);
+    return base + Math.floor(Math.random() * Math.min(300, base * 0.3 + 1));
+  }
+
+  function bgSend(message) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(message, (response) => {
+          if (chrome.runtime.lastError) {
+            resolve({
+              success: false,
+              error: chrome.runtime.lastError.message,
+            });
+          } else {
+            resolve(response || { success: false, error: "无响应" });
+          }
+        });
+      } catch (error) {
+        resolve({ success: false, error: error.message });
+      }
+    });
+  }
+
+  async function updateSession(patch) {
+    if (sessionState) {
+      sessionState = { ...sessionState, ...patch };
+    }
+    await bgSend({ action: "sessionUpdate", patch });
   }
 
   // 找到题目中第一个有效的元素用于定位
@@ -919,28 +1440,52 @@ ${payload}`;
   // 单选题 - 直接点击对应选项
   async function applySingleAnswerDirectly(question) {
     const answerLetter = String(question.answer).toUpperCase();
+    const option = (question.options || []).find(
+      (item) => String(item.label).toUpperCase() === answerLetter
+    );
 
-    for (const option of question.options) {
-      if (option.label.toUpperCase() === answerLetter) {
-        // 优先使用已解析的element
-        let element = option.element;
+    if (!option) {
+      throw new Error(`答案 ${answerLetter} 不在选项列表中`);
+    }
 
-        // 如果element无效，尝试重新查询
-        if (!element && option.selector) {
-          element = safeQuerySelector(option.selector);
-        }
+    let element = option.element;
+    if (!element && option.selector) {
+      element = safeQuerySelector(option.selector);
+    }
+    if (!element) {
+      throw new Error(`找不到选项 ${option.label} 的元素`);
+    }
 
-        if (element) {
-          await clickElement(element);
-          console.log(`[AI答题助手] 单选已点击: ${option.label}`);
-        } else {
-          console.warn(
-            `[AI答题助手] 找不到选项元素: ${option.label}, selector: ${option.selector}`
-          );
-        }
-        break;
+    const input =
+      element.tagName === "INPUT"
+        ? element
+        : element.querySelector('input[type="radio"], input[type="checkbox"]');
+
+    // 已经选中就不重复点击
+    if (input && input.type === "radio" && input.checked) {
+      return;
+    }
+
+    await clickElement(element);
+
+    if (input && input.type === "radio" && !input.checked) {
+      // 有些站点需要点击 label
+      const label =
+        input.closest("label") ||
+        (input.id
+          ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`)
+          : null);
+      if (label) {
+        label.click();
+        await sleep(100);
       }
     }
+
+    if (input && input.type === "radio" && !input.checked) {
+      throw new Error(`选项 ${option.label} 未能选中`);
+    }
+
+    console.log(`[AI答题助手] 单选已点击: ${option.label}`);
   }
 
   // 多选题 - 点击所有正确选项
@@ -950,102 +1495,191 @@ ${payload}`;
     // 确保answers是数组
     if (typeof answers === "string") {
       answers = answers
-        .split("")
-        .filter((c) => /[A-Z]/i.test(c))
+        .split(/[^A-Za-z]+/)
+        .filter(Boolean)
         .map((c) => c.toUpperCase());
     } else if (Array.isArray(answers)) {
       answers = answers.map((a) => String(a).toUpperCase());
+    } else {
+      answers = [];
     }
 
     console.log(`[AI答题助手] 多选答案:`, answers);
 
-    for (const option of question.options) {
-      if (answers.includes(option.label.toUpperCase())) {
-        let element = option.element;
+    for (const option of question.options || []) {
+      if (!answers.includes(String(option.label).toUpperCase())) continue;
 
-        if (!element && option.selector) {
-          element = safeQuerySelector(option.selector);
-        }
+      let element = option.element;
+      if (!element && option.selector) {
+        element = safeQuerySelector(option.selector);
+      }
+      if (!element) {
+        throw new Error(`找不到选项 ${option.label} 的元素`);
+      }
 
-        if (element) {
-          await clickElement(element);
-          console.log(`[AI答题助手] 多选已点击: ${option.label}`);
-          await sleep(200);
-        } else {
-          console.warn(
-            `[AI答题助手] 找不到选项元素: ${option.label}, selector: ${option.selector}`
-          );
+      const input =
+        element.tagName === "INPUT"
+          ? element
+          : element.querySelector('input[type="checkbox"]');
+
+      // 已经勾选就不重复点击（重复点击会取消勾选）
+      if (input && input.type === "checkbox" && input.checked) continue;
+
+      await clickElement(element);
+
+      // label 兜底
+      if (input && input.type === "checkbox" && !input.checked) {
+        const label =
+          input.closest("label") ||
+          (input.id
+            ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`)
+            : null);
+        if (label) {
+          label.click();
+          await sleep(100);
         }
       }
+
+      if (input && input.type === "checkbox" && !input.checked) {
+        throw new Error(`选项 ${option.label} 未能勾选`);
+      }
+
+      console.log(`[AI答题助手] 多选已点击: ${option.label}`);
+      await sleep(200);
     }
   }
 
   // 填空题 - 填写答案
   async function applyFillAnswerDirectly(question) {
-    let answers = question.answer;
+    const answers = (Array.isArray(question.answer)
+      ? question.answer
+      : [question.answer]
+    ).map((value) => String(value === undefined || value === null ? "" : value));
 
-    // 确保answers是数组
-    if (!Array.isArray(answers)) {
-      answers = [answers];
+    const inputs = (question.inputs || [])
+      .map((inputInfo) => {
+        let element = inputInfo.element;
+        if ((!element || !element.isConnected) && inputInfo.selector) {
+          element = safeQuerySelector(inputInfo.selector);
+        }
+        return element;
+      })
+      .filter(Boolean);
+
+    if (inputs.length === 0) {
+      throw new Error("找不到填空题输入框");
     }
 
-    // 获取第一个输入框
-    let inputElement = null;
-
-    for (const inputInfo of question.inputs) {
-      let element = inputInfo.element;
-      if (!element && inputInfo.selector) {
-        element = safeQuerySelector(inputInfo.selector);
-      }
-      if (element) {
-        inputElement = element;
-        break;
-      }
-    }
-
-    if (!inputElement) {
-      console.warn(`[AI答题助手] 找不到填空题输入框`);
+    if (inputs.length === 1) {
+      const combined =
+        answers.length === 1 ? answers[0] : answers.join("；");
+      await fillInput(inputs[0], combined);
+      console.log(`[AI答题助手] 填空已填写: ${combined}`);
       return;
     }
 
-    // 将所有答案合并为一个字符串填入同一个输入框
-    // 如果只有一个答案，直接使用；多个答案用中文分号 "；" 分隔
-    const combinedAnswer =
-      answers.length === 1
-        ? String(answers[0])
-        : answers.map((a) => String(a)).join("；");
+    // 多个输入框：按顺序填入；答案不足时只填已有部分
+    for (let index = 0; index < inputs.length; index += 1) {
+      let value = answers[index];
+      if (value === undefined) {
+        if (index === inputs.length - 1 && answers.length > inputs.length) {
+          value = answers.slice(index).join("；");
+        } else {
+          value = "";
+        }
+      }
+      if (!value) continue;
+      await fillInput(inputs[index], value);
+      console.log(`[AI答题助手] 填空 ${index + 1} 已填写: ${value}`);
+    }
 
-    await fillInput(inputElement, combinedAnswer);
-    console.log(`[AI答题助手] 填空已填写: ${combinedAnswer}`);
+    if (answers.length < inputs.length) {
+      console.warn(
+        `[AI答题助手] 答案数量(${answers.length})少于输入框数量(${inputs.length})`
+      );
+    }
   }
 
   // 填写输入框
   async function fillInput(element, value) {
+    if (!element) throw new Error("输入框不存在");
+
+    const text = String(value);
     element.focus();
     await sleep(50);
 
-    // 清空现有值
-    element.value = "";
+    // contenteditable 富文本输入框
+    if (element.isContentEditable) {
+      element.textContent = text;
+      element.dispatchEvent(
+        new InputEvent("input", { bubbles: true, composed: true })
+      );
+      element.dispatchEvent(
+        new Event("change", { bubbles: true, composed: true })
+      );
+      element.blur();
+      await sleep(50);
+      return;
+    }
 
-    // 设置新值
-    element.value = value;
+    // React 等受控组件需要走原生 setter，直接赋值可能被覆盖
+    try {
+      const proto =
+        element instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      if (descriptor && descriptor.set) {
+        descriptor.set.call(element, text);
+      } else {
+        element.value = text;
+      }
+    } catch (_) {
+      element.value = text;
+    }
 
-    // 触发各种事件确保框架能检测到变化
-    element.dispatchEvent(new Event("input", { bubbles: true }));
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-    element.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
-    element.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true }));
+    element.dispatchEvent(
+      new Event("input", { bubbles: true, composed: true })
+    );
+    element.dispatchEvent(
+      new Event("change", { bubbles: true, composed: true })
+    );
+    element.dispatchEvent(
+      new KeyboardEvent("keyup", { bubbles: true, composed: true })
+    );
+    element.dispatchEvent(
+      new KeyboardEvent("keydown", { bubbles: true, composed: true })
+    );
 
     element.blur();
+    await sleep(50);
+
+    if (
+      text &&
+      (element.tagName === "INPUT" || element.tagName === "TEXTAREA") &&
+      !element.value
+    ) {
+      throw new Error("输入框写入失败（可能被页面脚本覆盖）");
+    }
   }
 
   // Stop answering
   function stopAnswering() {
+    if (!isRunning) return;
+
     isRunning = false;
+    runFinished = true; // 防止 runSession 的 finally 重复上报
+    sessionState = null;
+
+    sendLog("warning", "已停止答题");
+    bgSend({ action: "sessionStop" });
+    bgSend({ action: "sessionClear" });
+    updateStats();
+    sendComplete(true);
   }
 
   // 逐题获取AI答案（只发送单道题目，不发送整页HTML）
-  async function getAIAnswerForQuestion(question) {
+  async function getAIAnswerForQuestion(question, hint = "") {
     let prompt = `请回答以下${getTypeLabel(question.type)}：\n\n`;
     prompt += `题目：${question.text}\n\n`;
 
@@ -1084,33 +1718,20 @@ ${payload}`;
 - 填空题answer为答案数组，如 ["答案1"] 或 ["答案1", "答案2"]
 - 只返回JSON，不要其他内容`;
 
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage(
-        {
-          action: "callAI",
-          config,
-          prompt,
-        },
-        (response) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
-          }
+    if (hint) {
+      prompt += `\n\n${hint}`;
+    }
 
-          if (!response.success) {
-            reject(new Error(response.error));
-            return;
-          }
+    const response = await bgSend({ action: "callAI", config, prompt });
+    if (!response.success) {
+      throw new Error(response.error || "AI 请求失败");
+    }
 
-          try {
-            const answer = parseAIResponse(response.data);
-            resolve(answer);
-          } catch (e) {
-            reject(new Error("解析AI响应失败: " + e.message));
-          }
-        }
-      );
-    });
+    try {
+      return parseAIResponse(response.data);
+    } catch (error) {
+      throw new Error(`解析AI响应失败: ${error.message}`);
+    }
   }
 
   // Get AI answer for a question (legacy, kept for compatibility)
@@ -1152,23 +1773,46 @@ ${payload}`;
 
   // Parse AI response
   function parseAIResponse(responseText) {
-    // Try to extract JSON from response
-    let jsonStr = responseText;
+    let text = String(responseText || "").trim();
 
     // Handle markdown code blocks
-    const jsonMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1];
+    const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fence) text = fence[1].trim();
+
+    // Most models return exactly one JSON object
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      /* fall through to balanced-brace extraction */
     }
 
-    // Try to find JSON object
-    const objMatch = jsonStr.match(/\{[\s\S]*\}/);
-    if (objMatch) {
-      jsonStr = objMatch[0];
+    // Find the first complete JSON object, ignoring braces inside strings
+    const start = text.indexOf("{");
+    if (start >= 0) {
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+
+      for (let index = start; index < text.length; index += 1) {
+        const char = text[index];
+        if (inString) {
+          if (escaped) escaped = false;
+          else if (char === "\\") escaped = true;
+          else if (char === '"') inString = false;
+        } else if (char === '"') {
+          inString = true;
+        } else if (char === "{") {
+          depth += 1;
+        } else if (char === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            return JSON.parse(text.slice(start, index + 1));
+          }
+        }
+      }
     }
 
-    const parsed = JSON.parse(jsonStr);
-    return parsed;
+    throw new Error("未找到完整的 JSON 对象");
   }
 
   // Apply answer to question
@@ -1401,23 +2045,42 @@ ${payload}`;
     element.classList.remove("ai-answer-processing");
   }
 
+  // 发送消息时读取 lastError，避免 popup 未打开时的控制台警告
+  function safeSendMessage(message) {
+    try {
+      chrome.runtime.sendMessage(message, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
   // Send log to popup
   function sendLog(level, text) {
-    chrome.runtime.sendMessage({ type: "log", level, text });
+    console.log(`[AI答题助手][${level}] ${text}`);
+    safeSendMessage({ type: "log", level, text });
   }
 
   // Update stats in popup
   function updateStats() {
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       type: "updateStats",
       questionCount: questions.length,
-      answeredCount,
+      answeredCount: totalAnswered,
+      pageAnsweredCount: answeredCount,
+      page: sessionState ? sessionState.page : lastPage,
+      isRunning,
     });
   }
 
   // Send complete message
-  function sendComplete() {
-    chrome.runtime.sendMessage({ type: "complete", answeredCount });
+  function sendComplete(stopped = false) {
+    safeSendMessage({
+      type: "complete",
+      answeredCount: totalAnswered,
+      stopped,
+    });
   }
 
   // Sleep utility
@@ -1426,17 +2089,24 @@ ${payload}`;
   }
 
   // Initialize
-  console.log("AI自动答题助手已加载");
+  console.log("[AI答题助手] v2 已加载");
 
-  // 初始化模板系统
-  if (window.templateManager) {
-    window.templateManager
-      .init()
-      .then(() => {
+  (async () => {
+    // 初始化模板系统
+    if (window.templateManager) {
+      try {
+        await window.templateManager.init();
         console.log("模板系统初始化完成");
-      })
-      .catch((error) => {
+      } catch (error) {
         console.error("模板系统初始化失败:", error);
-      });
-  }
+      }
+    }
+
+    // 整页刷新后尝试恢复未完成的答题会话
+    try {
+      await resumeRunIfNeeded();
+    } catch (error) {
+      console.warn("[AI答题助手] 自动恢复失败:", error);
+    }
+  })();
 })();

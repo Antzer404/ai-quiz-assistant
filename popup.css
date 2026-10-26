@@ -1,3 +1,5 @@
+/* 修改自 rehuan/AI-ANSWER-ASSISTANT（GPL-3.0），修改日期：2026-10-26 */
+
 :root {
   /* Monochrome Theme */
   --primary: #18181b; /* Zinc 900 */
@@ -573,4 +575,92 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-light);
+}
+
+/* v2 additions */
+.form-group select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: var(--text-main);
+  background: var(--bg-app);
+  transition: all 0.2s;
+}
+
+.form-group select:focus {
+  outline: none;
+  border-color: var(--text-main);
+  box-shadow: 0 0 0 1px var(--text-main);
+}
+
+.form-row {
+  display: flex;
+  gap: 12px;
+}
+
+.form-row .form-group {
+  flex: 1;
+  min-width: 0;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-main);
+  cursor: pointer;
+}
+
+.checkbox-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  flex: 0 0 auto;
+  accent-color: var(--primary);
+}
+
+.settings-section {
+  margin-bottom: 20px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.settings-section:last-of-type {
+  border-bottom: none;
+}
+
+.settings-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-main);
+  margin-bottom: 12px;
+}
+
+.field-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-light);
+  margin: -6px 0 14px;
+}
+
+.modal-footer-row {
+  display: flex;
+  gap: 10px;
+}
+
+.modal-footer-row .btn {
+  flex: 1;
+}
+
+.empty-state {
+  padding: 24px 12px;
+  text-align: center;
+  color: var(--text-light);
+  font-size: 13px;
+  line-height: 1.7;
 }

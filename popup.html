@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<!-- 修改自 rehuan/AI-ANSWER-ASSISTANT（GPL-3.0），修改日期：2026-10-26 -->
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -19,6 +20,9 @@
         </div>
       </div>
       <div class="header-actions">
+        <button class="icon-btn" id="openPrefsBtn" title="答题设置">
+          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 6h10M18 6h2M4 12h2M10 12h10M4 18h10M18 18h2M14 4v4M6 10v4M14 16v4" /></svg>
+        </button>
         <button class="icon-btn" id="openTemplatesBtn" title="模板管理">
           <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
         </button>
@@ -121,17 +125,122 @@
           </div>
           <div class="form-group">
             <label for="editModel">模型ID</label>
-            <input type="text" id="editModel" placeholder="gpt-4o-mini">
+            <input type="text" id="editModel" placeholder="deepseek-chat">
+          </div>
+          <div class="field-hint">
+            API Key 只保存在本机 chrome.storage.local，不会同步到云端。插件只支持 OpenAI 兼容的 /chat/completions 接口。
           </div>
           <div class="config-status" id="editStatus"></div>
         </div>
+        <div class="modal-footer modal-footer-row">
+          <button class="btn btn-outline" id="testModelBtn">测试连接</button>
+          <button class="btn btn-primary" id="saveModelBtn">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 答题设置浮层 -->
+    <div class="modal" id="prefsModal">
+      <div class="modal-backdrop" id="closePrefsBackdrop"></div>
+      <div class="modal-content modal-content-wide">
+        <div class="modal-header">
+          <h3>答题设置</h3>
+          <button class="icon-btn" id="closePrefsBtn">
+            <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="settings-section">
+            <div class="settings-section-title">自动下一题</div>
+            <label class="checkbox-row">
+              <input type="checkbox" id="prefAutoNext">
+              <span>答题完成后自动进入下一题/下一页</span>
+            </label>
+            <div class="form-group">
+              <label for="prefNextMode">翻页模式</label>
+              <select id="prefNextMode">
+                <option value="auto">自动判断（同页滚动 + 分页翻页）</option>
+                <option value="paginate">仅分页翻页</option>
+                <option value="scroll">仅同页滚动</option>
+              </select>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="prefQuestionDelay">每题间隔（毫秒）</label>
+                <input type="number" id="prefQuestionDelay" min="0" max="10000" step="100">
+              </div>
+              <div class="form-group">
+                <label for="prefPageDelay">翻页等待（毫秒）</label>
+                <input type="number" id="prefPageDelay" min="0" max="60000" step="100">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="prefMaxPages">最大页数</label>
+                <input type="number" id="prefMaxPages" min="1" max="200" step="1">
+              </div>
+              <div class="form-group">
+                <label for="prefMaxRunMinutes">最长运行（分钟）</label>
+                <input type="number" id="prefMaxRunMinutes" min="1" max="180" step="1">
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">安全与失败处理</div>
+            <label class="checkbox-row">
+              <input type="checkbox" id="prefRequireAllAnswered">
+              <span>本页有未完成题目时停止翻页</span>
+            </label>
+            <label class="checkbox-row">
+              <input type="checkbox" id="prefSkipOnError">
+              <span>单题失败时跳过，继续答下一题</span>
+            </label>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="prefMaxRetries">失败重试次数</label>
+                <input type="number" id="prefMaxRetries" min="0" max="5" step="1">
+              </div>
+              <div class="form-group">
+                <label for="prefResumeWaitMs">新页面等待（毫秒）</label>
+                <input type="number" id="prefResumeWaitMs" min="0" max="15000" step="100">
+              </div>
+            </div>
+            <div class="field-hint">
+              安全默认：检测到“提交/交卷”按钮时只会停下提示，不会自动提交。
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">按钮识别（高级）</div>
+            <div class="form-group">
+              <label for="prefNextSelector">下一题按钮 CSS 选择器（可选）</label>
+              <input type="text" id="prefNextSelector" placeholder="例如 .next-btn 或 button[data-action='next']">
+            </div>
+            <div class="form-group">
+              <label for="prefSubmitSelector">提交按钮 CSS 选择器（可选）</label>
+              <input type="text" id="prefSubmitSelector" placeholder="例如 .submit-btn">
+            </div>
+            <div class="form-group">
+              <label for="prefNextText">下一题按钮文字（逗号分隔）</label>
+              <input type="text" id="prefNextText" placeholder="下一题,下一页,继续">
+            </div>
+            <div class="form-group">
+              <label for="prefSubmitText">提交按钮文字（逗号分隔）</label>
+              <input type="text" id="prefSubmitText" placeholder="提交,交卷,完成">
+            </div>
+          </div>
+
+          <div class="config-status" id="prefsStatus"></div>
+        </div>
         <div class="modal-footer">
-          <button class="btn btn-primary btn-block" id="saveModelBtn">保存</button>
+          <button class="btn btn-primary btn-block" id="savePrefsBtn">保存设置</button>
         </div>
       </div>
     </div>
 
   </div>
+  <script src="modules/settings.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
