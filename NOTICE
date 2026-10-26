@@ -22,7 +22,12 @@ AI 自动答题助手（自定义版 v2）
    contenteditable 支持；失败重试；未答完默认停止翻页。
 6. 重构 background.js（超时、429/5xx 重试、错误分类）、content.js、popup.*；
    新增 modules/settings.js、modules/navigation.js。
-7. 更新 README 与 manifest。
+7. v1.1 新增 modules/site-memory.js：首次 AI 结构分析成功后，把题目结构学习为
+   可复用的本地模板（chrome.storage.local），同一站点后续扫描直接复用，跳过
+   AI 结构分析；支持同一站点多个页面结构，设置里可查看与清除。
+8. v1.1 新增“允许联网搜索”（自动/OpenAI/OpenRouter）与“思考强度”
+   （reasoning_effort）设置，作为请求参数传递给用户配置的模型服务。
+9. 更新 README 与 manifest。
 
 被修改的文件顶部均带有修改说明与日期。本程序整体按 GPL-3.0 分发，
 不附加任何额外限制；再分发时须保留本声明与 LICENSE，并提供完整源码。

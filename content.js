@@ -35,6 +35,9 @@
         nextSelector: "",
         submitSelector: "",
         resumeWaitMs: 2500,
+        webSearch: false,
+        webSearchProvider: "auto",
+        reasoningEffort: "",
         autoSubmit: false,
       };
   let sessionState = null;
@@ -167,7 +170,7 @@
     }
   }
 
-  // 扫描当前页面：模板优先，失败后回退到 AI
+  // 扫描当前页面：站点模板 -> 本地结构记忆 -> AI 分析
   async function performScan() {
     questions = [];
     answeredCount = 0;
@@ -196,12 +199,24 @@
           sendLog("success", `使用模板扫描成功，发现 ${result.count} 道题目`);
           return result.count;
         }
-        sendLog("warning", "模板扫描失败，回退到AI分析...");
+        sendLog("warning", "模板扫描失败，尝试本地结构记忆...");
       } catch (error) {
-        sendLog("error", `模板扫描出错: ${error.message}，回退到AI分析`);
+        sendLog("error", `模板扫描出错: ${error.message}，尝试本地结构记忆...`);
       }
     } else {
-      sendLog("info", "未找到匹配的站点模板，使用AI分析...");
+      sendLog("info", "未找到匹配的站点模板，尝试本地结构记忆...");
+    }
+
+    // 本地学习过的页面结构：直接 DOM 扫描，跳过 AI 结构分析
+    const remembered = await scanWithSiteMemory();
+    if (remembered && remembered.count > 0) {
+      questions = remembered.questions;
+      updateStats();
+      sendLog(
+        "success",
+        `使用本地结构记忆扫描成功，发现 ${remembered.count} 道题目（已跳过 AI 结构分析）`
+      );
+      return remembered.count;
     }
 
     if (!config || !config.baseUrl || !config.apiKey || !config.model) {
@@ -218,7 +233,13 @@
         const count = scanWithAISelectors(aiResult);
         if (count > 0) {
           updateStats();
-          sendLog("success", `AI分析成功，发现 ${count} 道题目`);
+          const learned = await rememberPageStructure();
+          sendLog(
+            "success",
+            `AI分析成功，发现 ${count} 道题目${
+              learned ? "；已记住本站结构，下次将跳过 AI 分析" : ""
+            }`
+          );
           return count;
         }
         sendLog("warning", "AI分析完成，但未能定位到题目元素");
@@ -231,6 +252,81 @@
 
     updateStats();
     return 0;
+  }
+
+  // 使用本地学习过的结构扫描；有多个模板时选取命中题目最多的
+  async function scanWithSiteMemory() {
+    if (!window.siteMemory || !window.EnhancedScanner) return null;
+
+    const host = location.hostname;
+    if (!host) return null;
+
+    let entries = [];
+    try {
+      entries = await window.siteMemory.getTemplates(host);
+    } catch (error) {
+      console.warn("[AI答题助手] 读取本地结构记忆失败:", error);
+      return null;
+    }
+    if (!entries.length) return null;
+
+    let best = null;
+    for (const entry of entries) {
+      try {
+        const scanner = new window.EnhancedScanner();
+        const result = scanner.scanWithTemplate(entry.template);
+        if (!result || !result.success || !result.count) continue;
+        // 有可作答控件却没解析出来，说明这个模板漏了题型：宁可用 AI 重新分析
+        if (result.missed > 0) {
+          console.log(
+            `[AI答题助手] 本地模板漏掉 ${result.missed} 个题目容器，回退 AI 分析`
+          );
+          continue;
+        }
+        if (!best || result.count > best.result.count) {
+          best = { entry, result };
+        }
+      } catch (error) {
+        console.warn("[AI答题助手] 本地模板扫描失败:", error);
+      }
+    }
+
+    if (!best) return null;
+
+    window.siteMemory
+      .recordResult(host, best.entry.id, true)
+      .catch(() => {});
+    console.log(`[AI答题助手] 本地结构记忆命中: ${best.entry.id}`);
+    return best.result;
+  }
+
+  // 把本次 AI 识别出的页面结构保存到本地，后续相同站点直接复用
+  async function rememberPageStructure() {
+    if (!window.siteMemory) return false;
+    try {
+      const template = await window.siteMemory.learnFromQuestions({
+        questions,
+        url: location.href,
+        origin: location.origin,
+      });
+      return Boolean(template);
+    } catch (error) {
+      console.warn("[AI答题助手] 学习页面结构失败:", error);
+      return false;
+    }
+  }
+
+  // 构造 AI 请求参数：联网搜索只用于逐题回答，结构分析不需要
+  function buildAIOptions({ webSearch = false } = {}) {
+    const options = {};
+    if (settings.reasoningEffort) {
+      options.reasoningEffort = settings.reasoningEffort;
+    }
+    if (webSearch && settings.webSearch) {
+      options.webSearch = true;
+      options.webSearchProvider = settings.webSearchProvider || "auto";
+    }
+    return options;
   }
 
   // Scan for questions on the page
@@ -661,7 +757,12 @@ ${contentIntro}
 HTML内容：
 ${payload}`;
 
-    const response = await bgSend({ action: "analyzeHTML", config, prompt });
+    const response = await bgSend({
+      action: "analyzeHTML",
+      config,
+      prompt,
+      options: buildAIOptions(),
+    });
     if (!response.success) {
       throw new Error(response.error || "AI 分析请求失败");
     }
@@ -1722,7 +1823,12 @@ ${payload}`;
       prompt += `\n\n${hint}`;
     }
 
-    const response = await bgSend({ action: "callAI", config, prompt });
+    const response = await bgSend({
+      action: "callAI",
+      config,
+      prompt,
+      options: buildAIOptions({ webSearch: true }),
+    });
     if (!response.success) {
       throw new Error(response.error || "AI 请求失败");
     }

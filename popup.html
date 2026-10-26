@@ -231,6 +231,47 @@
             </div>
           </div>
 
+          <div class="settings-section">
+            <div class="settings-section-title">AI 回答质量</div>
+            <label class="checkbox-row">
+              <input type="checkbox" id="prefWebSearch">
+              <span>允许联网搜索</span>
+            </label>
+            <div class="form-group">
+              <label for="prefWebSearchProvider">联网搜索方式</label>
+              <select id="prefWebSearchProvider">
+                <option value="auto">自动（按 Base URL 判断）</option>
+                <option value="openai">OpenAI web_search_options</option>
+                <option value="openrouter">OpenRouter 联网插件</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="prefReasoningEffort">思考强度</label>
+              <select id="prefReasoningEffort">
+                <option value="">默认（不发送该参数）</option>
+                <option value="minimal">极低（minimal）</option>
+                <option value="low">低（low）</option>
+                <option value="medium">中（medium）</option>
+                <option value="high">高（high）</option>
+              </select>
+            </div>
+            <div class="field-hint">
+              联网搜索会提高单题耗时和费用，且需要模型/服务支持；服务不支持时请关闭。思考强度只对支持
+              reasoning_effort 的模型有效，不确定时保持“默认”。
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-section-title">本地结构记忆</div>
+            <div class="field-hint" id="siteMemoryInfo">正在读取本地记忆...</div>
+            <button class="btn btn-outline btn-block" id="clearSiteMemoryBtn" type="button">
+              清除本地结构记忆
+            </button>
+            <div class="field-hint">
+              首次遇到新站点时用 AI 分析页面结构并自动记住；之后同一站点直接复用本地模板，不再重复分析，节省时间与 token。
+            </div>
+          </div>
+
           <div class="config-status" id="prefsStatus"></div>
         </div>
         <div class="modal-footer">

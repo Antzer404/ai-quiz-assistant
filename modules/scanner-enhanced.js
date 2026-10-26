@@ -1,8 +1,46 @@
+// 修改自 rehuan/AI-ANSWER-ASSISTANT（GPL-3.0），修改日期：2026-10-26
 // Scanner Enhanced Module - 增强扫描器
-// 使用站点模板进行题目扫描
+// 使用站点模板（内置 / 用户 / 本地学习）进行题目扫描
 
 (function () {
   "use strict";
+
+  function safeQueryAll(root, selector) {
+    if (!root || !selector) return [];
+    try {
+      return Array.from(root.querySelectorAll(selector));
+    } catch (error) {
+      console.warn("[EnhancedScanner] 选择器无效:", selector, error);
+      return [];
+    }
+  }
+
+  function safeQuery(root, selector) {
+    if (!root || !selector) return null;
+    try {
+      return root.querySelector(selector);
+    } catch (error) {
+      console.warn("[EnhancedScanner] 选择器无效:", selector, error);
+      return null;
+    }
+  }
+
+  function safeMatches(element, selector) {
+    if (!element || !selector) return false;
+    try {
+      return element.matches(selector);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // 容器里存在可作答控件，却没有被解析出来：通常意味着模板漏了某种题型
+  const ANSWERABLE_SELECTOR =
+    'input[type="radio"], input[type="checkbox"], input[type="text"], input[type="number"], input:not([type]), textarea, [contenteditable="true"]';
+
+  function hasAnswerableInput(element) {
+    return Boolean(safeQuery(element, ANSWERABLE_SELECTOR));
+  }
 
   class EnhancedScanner {
     constructor() {
@@ -12,7 +50,7 @@
     /**
      * 使用模板扫描题目
      * @param {Object} template 站点模板
-     * @returns {Object} 扫描结果 { success: boolean, questions: Array, count: number }
+     * @returns {Object} 扫描结果 { success, questions, count, found, skipped }
      */
     scanWithTemplate(template) {
       console.log("[EnhancedScanner] 开始使用模板扫描:", template.siteName);
@@ -21,21 +59,29 @@
       const selectors = template.selectors;
 
       try {
-        // 获取所有题目容器
-        const questionElements = document.querySelectorAll(
+        const questionElements = safeQueryAll(
+          document,
           selectors.questionContainer
         );
 
         if (questionElements.length === 0) {
           console.warn("[EnhancedScanner] 未找到题目容器");
-          return { success: false, questions: [], count: 0 };
+          return {
+            success: false,
+            questions: [],
+            count: 0,
+            found: 0,
+            skipped: 0,
+            missed: 0,
+          };
         }
 
         console.log(
           `[EnhancedScanner] 找到 ${questionElements.length} 个题目容器`
         );
 
-        // 遍历每个题目
+        let skipped = 0;
+        let missed = 0;
         questionElements.forEach((element, index) => {
           const question = this._parseQuestionWithTemplate(
             element,
@@ -44,17 +90,24 @@
           );
           if (question) {
             this.questions.push(question);
+          } else {
+            skipped += 1;
+            if (hasAnswerableInput(element)) missed += 1;
           }
         });
 
         console.log(
-          `[EnhancedScanner] 扫描完成，解析成功 ${this.questions.length} 道题`
+          `[EnhancedScanner] 扫描完成，解析成功 ${this.questions.length} 道题` +
+            (skipped ? `，跳过 ${skipped} 个非题目容器` : "")
         );
 
         return {
           success: this.questions.length > 0,
           questions: this.questions,
           count: this.questions.length,
+          found: questionElements.length,
+          skipped,
+          missed,
         };
       } catch (error) {
         console.error("[EnhancedScanner] 扫描失败:", error);
@@ -62,6 +115,9 @@
           success: false,
           questions: [],
           count: 0,
+          found: 0,
+          skipped: 0,
+          missed: 0,
           error: error.message,
         };
       }
@@ -75,18 +131,69 @@
       const selectors = template.selectors;
       const questionTypes = selectors.questionTypes;
 
+      const isTypeConfig = (key, config) =>
+        key !== "detectByAttribute" &&
+        key !== "detectByInput" &&
+        key !== "detectByClass" &&
+        config &&
+        typeof config === "object";
+
       // 确定题目类型
       let questionType = null;
       let typeSelectors = null;
 
-      if (selectors.questionTypes.detectByAttribute) {
+      if (questionTypes.detectByInput) {
+        // 本地学习模板：按 input 类型 / 容器特征 / 题干关键词识别题型
+        for (const [type, config] of Object.entries(questionTypes)) {
+          if (!isTypeConfig(type, config)) continue;
+
+          if (config.optionInput && safeQuery(element, config.optionInput)) {
+            questionType = type;
+            typeSelectors = config;
+            break;
+          }
+          if (config.inputs && safeQuery(element, config.inputs)) {
+            questionType = type;
+            typeSelectors = config;
+            break;
+          }
+          if (config.detectClass && element.classList.contains(config.detectClass)) {
+            questionType = type;
+            typeSelectors = config;
+            break;
+          }
+          if (
+            config.detectAttribute &&
+            element.getAttribute(config.detectAttribute.name) ===
+              config.detectAttribute.value
+          ) {
+            questionType = type;
+            typeSelectors = config;
+            break;
+          }
+          if (config.detectText) {
+            const titleEl = safeQuery(element, config.title);
+            const text = titleEl
+              ? titleEl.textContent
+              : element.textContent.slice(0, 300);
+            try {
+              if (new RegExp(config.detectText, "i").test(text)) {
+                questionType = type;
+                typeSelectors = config;
+                break;
+              }
+            } catch (_) {
+              /* 无效正则忽略 */
+            }
+          }
+        }
+      } else if (questionTypes.detectByAttribute) {
         // 通过属性判断类型
-        const attrName = selectors.questionTypes.detectByAttribute;
+        const attrName = questionTypes.detectByAttribute;
         const typeValue = element.getAttribute(attrName);
 
-        // 查找匹配的类型
         for (const [type, config] of Object.entries(questionTypes)) {
-          if (type === "detectByAttribute") continue;
+          if (!isTypeConfig(type, config)) continue;
           if (config.typeValue === typeValue) {
             questionType = type;
             typeSelectors = config;
@@ -96,8 +203,8 @@
       } else {
         // 通过选择器判断类型
         for (const [type, config] of Object.entries(questionTypes)) {
-          if (type === "detectByAttribute") continue;
-          if (element.matches(config.container)) {
+          if (!isTypeConfig(type, config)) continue;
+          if (safeMatches(element, config.container)) {
             questionType = type;
             typeSelectors = config;
             break;
@@ -105,33 +212,37 @@
         }
       }
 
-      if (!questionType) {
-        console.warn("[EnhancedScanner] 无法确定题目类型:", element);
+      if (!questionType || !typeSelectors) {
         return null;
       }
 
-      // 构建题目对象
+      // 提取题目文本；没有题干就无法作答，直接跳过
+      const titleElement = safeQuery(element, typeSelectors.title);
+      const text = titleElement
+        ? this._cleanText(titleElement.textContent)
+        : "";
+      if (!text) {
+        console.warn("[EnhancedScanner] 题目缺少题干文本，跳过:", element);
+        return null;
+      }
+
       const question = {
         index: index,
         type: questionType,
-        text: "",
+        text,
         options: [],
         inputs: [],
         answered: false,
         element: element,
       };
 
-      // 提取题目文本
-      const titleElement = element.querySelector(typeSelectors.title);
-      if (titleElement) {
-        question.text = this._cleanText(titleElement.textContent);
-      }
-
-      // 根据类型提取选项或输入框
       if (questionType === "single" || questionType === "multiple") {
         question.options = this._parseOptions(element, typeSelectors, template);
+        if (question.options.length < 2) return null;
+        if (!question.options.some((option) => option.text)) return null;
       } else if (questionType === "fill") {
         question.inputs = this._parseInputs(element, typeSelectors);
+        if (question.inputs.length === 0) return null;
       }
 
       console.log(
@@ -148,40 +259,55 @@
      */
     _parseOptions(container, typeSelectors, template) {
       const options = [];
-      const optionElements = container.querySelectorAll(
+      const optionElements = safeQueryAll(
+        container,
         typeSelectors.optionItem
       );
 
       optionElements.forEach((optionEl, idx) => {
-        // 查找input元素
-        const input = optionEl.querySelector(typeSelectors.optionInput);
-        if (!input) return;
+        // optionInput 为空时，选项元素本身就是点击目标
+        let target = optionEl;
+        if (typeSelectors.optionInput) {
+          target = safeQuery(optionEl, typeSelectors.optionInput);
+          if (!target) return;
+        }
 
-        // 查找label文本
-        const labelEl = optionEl.querySelector(typeSelectors.optionLabel);
-        let optionText = labelEl ? labelEl.textContent.trim() : "";
+        // optionLabel 为空时，使用整个选项行的文本
+        let optionText = "";
+        if (typeSelectors.optionLabel) {
+          const labelEl = safeQuery(optionEl, typeSelectors.optionLabel);
+          optionText = labelEl ? labelEl.textContent.trim() : "";
+        }
+        if (!optionText) {
+          optionText = (target !== optionEl ? optionEl : target)
+            .textContent.trim();
+        }
 
         // 提取选项字母
         let optionLabel = String.fromCharCode(65 + idx); // 默认A, B, C...
 
         if (typeSelectors.optionLabelPattern && optionText) {
-          const pattern = new RegExp(typeSelectors.optionLabelPattern);
-          const match = optionText.match(pattern);
-          if (match && match[1]) {
-            optionLabel = match[1];
-            // 移除前缀
-            optionText = optionText.substring(match[0].length).trim();
+          try {
+            const pattern = new RegExp(typeSelectors.optionLabelPattern);
+            const match = optionText.match(pattern);
+            if (match && match[1]) {
+              optionLabel = match[1];
+              // 移除前缀
+              optionText = optionText.substring(match[0].length).trim();
+            }
+          } catch (_) {
+            /* 无效正则忽略 */
           }
         }
 
         // 生成精确选择器
-        const selector = this._generateSelector(input, template);
+        const selector = this._generateSelector(target, template);
 
         options.push({
           label: optionLabel,
           text: optionText,
           selector: selector,
-          element: input,
+          element: target,
         });
       });
 
@@ -194,7 +320,7 @@
      */
     _parseInputs(container, typeSelectors) {
       const inputs = [];
-      const inputElements = container.querySelectorAll(typeSelectors.inputs);
+      const inputElements = safeQueryAll(container, typeSelectors.inputs);
 
       inputElements.forEach((input) => {
         const selector = this._generateSelector(input);

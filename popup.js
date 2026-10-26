@@ -54,6 +54,11 @@ const prefNextSelector = document.getElementById("prefNextSelector");
 const prefSubmitSelector = document.getElementById("prefSubmitSelector");
 const prefNextText = document.getElementById("prefNextText");
 const prefSubmitText = document.getElementById("prefSubmitText");
+const prefWebSearch = document.getElementById("prefWebSearch");
+const prefWebSearchProvider = document.getElementById("prefWebSearchProvider");
+const prefReasoningEffort = document.getElementById("prefReasoningEffort");
+const siteMemoryInfo = document.getElementById("siteMemoryInfo");
+const clearSiteMemoryBtn = document.getElementById("clearSiteMemoryBtn");
 
 let editingModelId = null;
 
@@ -139,6 +144,7 @@ closeEditBackdrop.addEventListener("click", closeEditModal);
 // 答题设置
 openPrefsBtn.addEventListener("click", async () => {
   await loadPrefs();
+  await renderSiteMemoryInfo();
   prefsModal.classList.add("open");
 });
 closePrefsBtn.addEventListener("click", () => {
@@ -533,7 +539,17 @@ function renderPrefs() {
   prefSubmitSelector.value = prefs.submitSelector || "";
   prefNextText.value = (prefs.nextText || []).join(",");
   prefSubmitText.value = (prefs.submitText || []).join(",");
+  prefWebSearch.checked = Boolean(prefs.webSearch);
+  prefWebSearchProvider.value = prefs.webSearchProvider || "auto";
+  prefReasoningEffort.value = prefs.reasoningEffort || "";
+  updateWebSearchControls();
 }
+
+function updateWebSearchControls() {
+  prefWebSearchProvider.disabled = !prefWebSearch.checked;
+}
+
+prefWebSearch.addEventListener("change", updateWebSearchControls);
 
 function collectPrefs() {
   return {
@@ -551,8 +567,56 @@ function collectPrefs() {
     submitSelector: prefSubmitSelector.value,
     nextText: prefNextText.value,
     submitText: prefSubmitText.value,
+    webSearch: prefWebSearch.checked,
+    webSearchProvider: prefWebSearchProvider.value,
+    reasoningEffort: prefReasoningEffort.value,
   };
 }
+
+async function renderSiteMemoryInfo() {
+  if (!siteMemoryInfo) return;
+  try {
+    const data = await chrome.storage.local.get("siteStructureMemory");
+    const store = data.siteStructureMemory;
+    const sites =
+      store && store.sites && typeof store.sites === "object"
+        ? Object.values(store.sites)
+        : [];
+    const templateCount = sites.reduce(
+      (sum, site) =>
+        sum + (Array.isArray(site.templates) ? site.templates.length : 0),
+      0
+    );
+
+    if (!sites.length) {
+      siteMemoryInfo.textContent =
+        "还没有本地结构记忆。首次遇到新站点时会自动学习。";
+      return;
+    }
+
+    const hosts = sites
+      .map((site) => site.host)
+      .filter(Boolean)
+      .slice(0, 6)
+      .join("、");
+    siteMemoryInfo.textContent = `已记住 ${sites.length} 个站点、${templateCount} 个页面结构${
+      hosts ? `：${hosts}${sites.length > 6 ? " 等" : ""}` : ""
+    }`;
+  } catch (error) {
+    siteMemoryInfo.textContent = "读取本地结构记忆失败";
+  }
+}
+
+clearSiteMemoryBtn.addEventListener("click", async () => {
+  const confirmed = confirm(
+    "确定要清除所有本地结构记忆吗？下次遇到这些站点会重新用 AI 分析页面结构。"
+  );
+  if (!confirmed) return;
+
+  await chrome.storage.local.remove("siteStructureMemory");
+  await renderSiteMemoryInfo();
+  addLog("info", "已清除本地结构记忆");
+});
 
 async function savePrefs() {
   savePrefsBtn.disabled = true;
@@ -642,6 +706,7 @@ async function injectContentScript(tabId) {
         "modules/site-matcher.js",
         "modules/template-manager.js",
         "modules/scanner-enhanced.js",
+        "modules/site-memory.js",
         "content.js",
       ],
     });

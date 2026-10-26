@@ -133,6 +133,22 @@ async function callAI(config, prompt, mode = "answer", options = {}) {
     body.max_tokens = clamp(options.maxTokens, 1, 4096);
   }
 
+  // 思考强度：仅在用户显式选择时发送，避免不支持该参数的模型报错
+  const reasoningEffort = normalizeReasoningEffort(options.reasoningEffort);
+  if (reasoningEffort) {
+    body.reasoning_effort = reasoningEffort;
+  }
+
+  // 联网搜索：不同 OpenAI 兼容服务的参数不同，按 Base URL 自动或手动选择
+  if (options.webSearch) {
+    const provider = resolveWebSearchProvider(options.webSearchProvider, url);
+    if (provider === "openrouter") {
+      body.plugins = [{ id: "web" }];
+    } else {
+      body.web_search_options = { search_context_size: "medium" };
+    }
+  }
+
   let lastError = null;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -267,6 +283,26 @@ function systemPrompt(mode) {
 1. 只返回JSON，不要有其他内容
 2. 确保JSON格式正确
 3. 答案要准确`;
+}
+
+function normalizeReasoningEffort(value) {
+  const effort = String(value || "").toLowerCase();
+  return ["minimal", "low", "medium", "high"].includes(effort) ? effort : "";
+}
+
+function resolveWebSearchProvider(value, url) {
+  const provider = String(value || "auto").toLowerCase();
+  if (provider === "openai" || provider === "openrouter") return provider;
+
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (host === "openrouter.ai" || host.endsWith(".openrouter.ai")) {
+      return "openrouter";
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  return "openai";
 }
 
 function buildChatCompletionsUrl(baseUrl) {

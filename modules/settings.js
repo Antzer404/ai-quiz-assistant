@@ -33,6 +33,11 @@
 
     // 页面加载等待
     resumeWaitMs: 2500,
+
+    // AI 回答质量
+    webSearch: false, // 是否允许联网搜索
+    webSearchProvider: "auto", // auto | openai | openrouter
+    reasoningEffort: "", // ""(默认) | minimal | low | medium | high
   };
 
   function clampInt(value, min, max, fallback) {
@@ -64,6 +69,18 @@
       ? merged.nextMode
       : DEFAULTS.nextMode;
 
+    const webSearchProvider = ["auto", "openai", "openrouter"].includes(
+      merged.webSearchProvider
+    )
+      ? merged.webSearchProvider
+      : DEFAULTS.webSearchProvider;
+
+    const reasoningEffort = ["minimal", "low", "medium", "high"].includes(
+      merged.reasoningEffort
+    )
+      ? merged.reasoningEffort
+      : "";
+
     return {
       autoNext: Boolean(merged.autoNext),
       nextMode,
@@ -94,6 +111,9 @@
         15000,
         DEFAULTS.resumeWaitMs
       ),
+      webSearch: Boolean(merged.webSearch),
+      webSearchProvider,
+      reasoningEffort,
       // 安全默认：永远不自动提交。保留字段是为了未来显式开启时也便于审计。
       autoSubmit: false,
     };
