@@ -212,15 +212,34 @@ async function callAI(config, prompt, mode = "answer", options = {}) {
         );
       }
 
-      const content = data && data.choices && data.choices[0] && data.choices[0].message
-        ? data.choices[0].message.content
-        : null;
+      const choice = data && data.choices && data.choices[0];
+      const message = choice && choice.message;
+      const content = message ? message.content : null;
+      const reasoningContent =
+        message && (message.reasoning_content || message.reasoning);
 
       if (typeof content !== "string" || !content.trim()) {
+        // 测试连接只关心“能否正常拿到 200 响应”，推理模型可能把 token
+        // 全部花在思考上，content 为空但连接是正常的
+        if (options.acceptEmptyContent && message) {
+          return "";
+        }
+
+        const hasReasoning =
+          typeof reasoningContent === "string" && reasoningContent.trim();
+        const finish = choice && choice.finish_reason
+          ? `，finish_reason=${choice.finish_reason}`
+          : "";
+        const reason = hasReasoning
+          ? "模型只返回了思考过程（reasoning_content），content 为空；" +
+            "可能原因：模型是推理模型且思考强度太高，或 max_tokens 太小"
+          : "缺少 choices[0].message.content";
+
         throw new Error(
-          `API 返回格式错误：缺少 choices[0].message.content（${JSON.stringify(
-            data
-          ).slice(0, 200)}）`
+          `API 返回格式错误：${reason}${finish}（${JSON.stringify(data).slice(
+            0,
+            200
+          )}）`
         );
       }
 
@@ -377,14 +396,18 @@ async function testConnection(config) {
   const startedAt = Date.now();
   try {
     const content = await callAI(config, "请只回复 OK", "answer", {
-      timeoutMs: 20000,
+      timeoutMs: 30000,
       retries: 0,
-      maxTokens: 16,
+      maxTokens: 256,
+      acceptEmptyContent: true,
     });
+    const sample = String(content || "").trim().slice(0, 80);
     return {
       success: true,
       latency: Date.now() - startedAt,
-      sample: String(content).slice(0, 80),
+      sample:
+        sample ||
+        "OK（模型返回了空的 content，通常是推理模型把 token 用于思考；连接正常）",
     };
   } catch (error) {
     return {

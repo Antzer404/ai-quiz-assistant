@@ -234,12 +234,15 @@
         if (count > 0) {
           updateStats();
           const learned = await rememberPageStructure();
-          sendLog(
-            "success",
-            `AI分析成功，发现 ${count} 道题目${
-              learned ? "；已记住本站结构，下次将跳过 AI 分析" : ""
-            }`
-          );
+          sendLog("success", `AI分析成功，发现 ${count} 道题目`);
+          if (learned.ok) {
+            sendLog("info", "已记住本站结构，下次将跳过 AI 分析");
+          } else {
+            sendLog(
+              "warning",
+              `未能记住本站结构：${learned.reason}；后续页面仍会用 AI 分析`
+            );
+          }
           return count;
         }
         sendLog("warning", "AI分析完成，但未能定位到题目元素");
@@ -302,17 +305,24 @@
 
   // 把本次 AI 识别出的页面结构保存到本地，后续相同站点直接复用
   async function rememberPageStructure() {
-    if (!window.siteMemory) return false;
+    if (!window.siteMemory) {
+      return { ok: false, reason: "本地记忆模块未加载" };
+    }
     try {
       const template = await window.siteMemory.learnFromQuestions({
         questions,
         url: location.href,
         origin: location.origin,
       });
-      return Boolean(template);
+      if (template) return { ok: true, reason: "" };
+      return {
+        ok: false,
+        reason:
+          window.siteMemory.lastLearnError || "页面结构不适合生成可复用模板",
+      };
     } catch (error) {
       console.warn("[AI答题助手] 学习页面结构失败:", error);
-      return false;
+      return { ok: false, reason: error.message };
     }
   }
 
@@ -1562,6 +1572,17 @@ ${payload}`;
         ? element
         : element.querySelector('input[type="radio"], input[type="checkbox"]');
 
+    // 纯点击选项：没有原生 input，直接点击并尽量判断是否已选中
+    if (!input) {
+      if (isOptionSelected(element)) {
+        console.log(`[AI答题助手] 单选已选中: ${option.label}`);
+        return;
+      }
+      await clickElementOnce(element);
+      console.log(`[AI答题助手] 单选已点击: ${option.label}`);
+      return;
+    }
+
     // 已经选中就不重复点击
     if (input && input.type === "radio" && input.checked) {
       return;
@@ -1622,6 +1643,18 @@ ${payload}`;
         element.tagName === "INPUT"
           ? element
           : element.querySelector('input[type="checkbox"]');
+
+      // 纯点击选项：只点击一次，已选中则跳过
+      if (!input) {
+        if (isOptionSelected(element)) {
+          console.log(`[AI答题助手] 多选已选中: ${option.label}`);
+          continue;
+        }
+        await clickElementOnce(element);
+        console.log(`[AI答题助手] 多选已点击: ${option.label}`);
+        await sleep(200);
+        continue;
+      }
 
       // 已经勾选就不重复点击（重复点击会取消勾选）
       if (input && input.type === "checkbox" && input.checked) continue;
@@ -1991,6 +2024,67 @@ ${payload}`;
 
       await sleep(100);
     }
+  }
+
+  // 纯点击选项（没有原生 input）：判断选项当前是否已选中
+  function isOptionSelected(element) {
+    if (!element) return false;
+
+    let node = element;
+    let depth = 0;
+    while (node && node.nodeType === Node.ELEMENT_NODE && depth < 2) {
+      const aria = node.getAttribute("aria-checked");
+      if (aria === "true" || aria === "mixed") return true;
+      if (node.hasAttribute("data-selected") || node.hasAttribute("data-checked")) {
+        return true;
+      }
+      const className =
+        typeof node.className === "string" ? node.className : "";
+      if (/(^|\s)(selected|checked|active|current)(\s|$)/i.test(className)) {
+        return true;
+      }
+      node = node.parentElement;
+      depth += 1;
+    }
+    return false;
+  }
+
+  // 纯点击选项：只触发一次 click，避免多选被连续点两次而取消
+  async function clickElementOnce(element) {
+    if (!element) return;
+
+    try {
+      element.dispatchEvent(
+        new MouseEvent("mousedown", {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+        })
+      );
+      element.dispatchEvent(
+        new MouseEvent("mouseup", {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+        })
+      );
+    } catch (_) {
+      /* ignore */
+    }
+
+    try {
+      element.click();
+    } catch (_) {
+      element.dispatchEvent(
+        new MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+        })
+      );
+    }
+
+    await sleep(50);
   }
 
   // Click element - 增强版，支持多种点击方式

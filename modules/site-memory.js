@@ -407,6 +407,34 @@
     return null;
   }
 
+  // 纯点击选项（没有 input）：从 AI 指向的元素向上找最像“选项行”的可点击元素
+  function findClickableItem(element, container) {
+    if (!element || !container) return null;
+
+    let node = element;
+    let best = element;
+    let depth = 0;
+
+    while (node && node !== container && depth < 4) {
+      const className = classListOf(node).join(" ");
+      const role = node.getAttribute("role");
+      if (
+        /option|choice|answer|item|radio|checkbox/i.test(className) ||
+        role === "radio" ||
+        role === "checkbox"
+      ) {
+        best = node;
+      }
+      node = node.parentElement;
+      depth += 1;
+    }
+
+    if (!normalizeText(best.textContent)) {
+      return null;
+    }
+    return best;
+  }
+
   function prepareChoiceGroup(group) {
     const prepared = [];
 
@@ -427,12 +455,17 @@
                 element,
                 'input[type="radio"], input[type="checkbox"]'
               );
-        if (!input) return null; // 无法可靠区分单选/多选：不学习，回退 AI
 
-        const item = findOptionItem(input, entry.container);
-        if (!item || !entry.container.contains(item)) return null;
-
-        items.push({ item, input, option, element });
+        if (input) {
+          const item = findOptionItem(input, entry.container);
+          if (!item || !entry.container.contains(item)) return null;
+          items.push({ item, input, option, element });
+        } else {
+          // 纯点击选项：没有原生 input，靠选项行本身的点击事件
+          const item = findClickableItem(element, entry.container);
+          if (!item || !entry.container.contains(item)) return null;
+          items.push({ item, input: null, option, element });
+        }
       }
 
       if (items.length < 2) return null;
@@ -496,16 +529,28 @@
     candidates.forEach((selector) => {
       for (const entry of prepared) {
         const found = safeQueryAll(entry.container, selector);
-        // 数量必须完全吻合，避免把题干/其他 label 误当成选项
-        if (found.length !== entry.items.length) return;
+
         if (!entry.items.every(({ item }) => found.includes(item))) return;
 
         if (optionInput) {
+          // 有 input 时允许少量额外匹配（例如“其他”选项、装饰性 label）：
+          // 扫描器会跳过不含目标 input 的选项行，不会影响答案映射
+          if (found.length < entry.items.length) return;
+          if (
+            found.length - entry.items.length >
+            Math.max(2, entry.items.length)
+          ) {
+            return;
+          }
           for (const { item } of entry.items) {
             const input = safeQuery(item, optionInput);
             if (!input) return;
             if (input.type && input.type !== expectedType) return;
           }
+        } else {
+          // 纯点击选项没有 input 作为过滤条件，要求数量完全吻合，
+          // 避免把题干或其他文本行误当成选项
+          if (found.length !== entry.items.length) return;
         }
       }
 
@@ -545,8 +590,18 @@
     if (!prepared) return null;
 
     const type = group[0].question.type;
-    const optionInput = chooseOptionInputSelector(prepared, type);
-    if (!optionInput) return null;
+    const hasInput = prepared.every((entry) =>
+      entry.items.every(({ input }) => Boolean(input))
+    );
+    const hasNoInput = prepared.every((entry) =>
+      entry.items.every(({ input }) => !input)
+    );
+    if (!hasInput && !hasNoInput) return null;
+
+    const optionInput = hasInput
+      ? chooseOptionInputSelector(prepared, type)
+      : "";
+    if (hasInput && !optionInput) return null;
 
     const optionItem = chooseOptionItemSelector(
       prepared,
@@ -633,51 +688,60 @@
       classSets[type] = common.filter((name) => !STATE_CLASS.test(name));
     });
 
-    keys.forEach((type) => {
-      const config = types[type];
-      if (config.optionInput || config.inputs) return;
+    // 只有观察到至少两种题型时，容器 class/属性才具有“区分”意义；
+    // 否则会把所有题都当成同一类型，宁可放弃学习也不冒答错的风险
+    const observedTypes = keys.filter(
+      (type) => uniqueElements(typeContainers[type] || []).length > 0
+    );
+    if (observedTypes.length >= 2) {
+      keys.forEach((type) => {
+        const config = types[type];
+        if (config.optionInput || config.inputs) return;
 
-      const otherClasses = new Set();
-      keys
-        .filter((key) => key !== type)
-        .forEach((key) => classSets[key].forEach((name) => otherClasses.add(name)));
-
-      const uniqueClass = classSets[type].find(
-        (name) => !otherClasses.has(name)
-      );
-      if (uniqueClass) config.detectClass = uniqueClass;
-    });
-
-    // 属性区分（例如 type="3" / data-question-type="radio"）
-    const attrNames = ["data-question-type", "data-type", "type"];
-    keys.forEach((type) => {
-      const config = types[type];
-      if (config.optionInput || config.inputs || config.detectClass) return;
-
-      const elements = uniqueElements(typeContainers[type] || []);
-      if (!elements.length) return;
-
-      for (const attr of attrNames) {
-        if (!elements.every((element) => element.hasAttribute(attr))) continue;
-        const value = elements[0].getAttribute(attr);
-        if (!value) continue;
-
-        const others = keys
+        const otherClasses = new Set();
+        observedTypes
           .filter((key) => key !== type)
-          .flatMap((key) => uniqueElements(typeContainers[key] || []));
-        if (
-          others.some(
-            (element) =>
-              element.hasAttribute(attr) && element.getAttribute(attr) === value
-          )
-        ) {
-          continue;
-        }
+          .forEach((key) =>
+            classSets[key].forEach((name) => otherClasses.add(name))
+          );
 
-        config.detectAttribute = { name: attr, value };
-        break;
-      }
-    });
+        const uniqueClass = classSets[type].find(
+          (name) => !otherClasses.has(name)
+        );
+        if (uniqueClass) config.detectClass = uniqueClass;
+      });
+
+      // 属性区分（例如 type="3" / data-question-type="radio"）
+      const attrNames = ["data-question-type", "data-type", "type"];
+      keys.forEach((type) => {
+        const config = types[type];
+        if (config.optionInput || config.inputs || config.detectClass) return;
+
+        const elements = uniqueElements(typeContainers[type] || []);
+        if (!elements.length) return;
+
+        for (const attr of attrNames) {
+          if (!elements.every((element) => element.hasAttribute(attr))) continue;
+          const value = elements[0].getAttribute(attr);
+          if (!value) continue;
+
+          const others = observedTypes
+            .filter((key) => key !== type)
+            .flatMap((key) => uniqueElements(typeContainers[key] || []));
+          if (
+            others.some(
+              (element) =>
+                element.hasAttribute(attr) && element.getAttribute(attr) === value
+            )
+          ) {
+            continue;
+          }
+
+          config.detectAttribute = { name: attr, value };
+          break;
+        }
+      });
+    }
 
     // 题干关键词（主要针对“可点击 div”类选项）
     keys.forEach((type) => {
@@ -692,14 +756,105 @@
       }
     });
 
-    // 没有任何识别方式的配置会让扫描器误判，直接移除
-    keys.forEach((type) => {
+  }
+
+  // 纯点击选项：用选项行自身的 class / role / data-* 区分单选和多选
+  function applyOptionDistinguishers(types, groups) {
+    const clickTypes = Object.keys(types).filter((type) => {
+      const config = types[type];
+      return (
+        config &&
+        !config.optionInput &&
+        !config.inputs &&
+        config.optionItem
+      );
+    });
+    if (clickTypes.length < 2) return;
+
+    const classSets = {};
+    const attrSets = {};
+    const attrNames = [
+      "role",
+      "data-type",
+      "data-option-type",
+      "data-choice-type",
+    ];
+
+    clickTypes.forEach((type) => {
+      const config = types[type];
+      const items = [];
+      (groups[type] || []).forEach(({ container }) => {
+        safeQueryAll(container, config.optionItem).forEach((element) => {
+          if (element && !items.includes(element)) items.push(element);
+        });
+      });
+
+      if (!items.length) {
+        classSets[type] = [];
+        attrSets[type] = {};
+        return;
+      }
+
+      let common = classListOf(items[0]);
+      for (let i = 1; i < items.length; i += 1) {
+        const set = new Set(classListOf(items[i]));
+        common = common.filter((name) => set.has(name));
+      }
+      classSets[type] = common.filter((name) => !STATE_CLASS.test(name));
+
+      const attrs = {};
+      attrNames.forEach((attr) => {
+        const value = items[0].getAttribute(attr);
+        if (!value) return;
+        if (items.every((element) => element.getAttribute(attr) === value)) {
+          attrs[attr] = value;
+        }
+      });
+      attrSets[type] = attrs;
+    });
+
+    clickTypes.forEach((type) => {
+      const config = types[type];
+      if (config.detectClass || config.detectAttribute) return;
+
+      const otherTypes = clickTypes.filter((key) => key !== type);
+      const otherClasses = new Set();
+      otherTypes.forEach((key) =>
+        (classSets[key] || []).forEach((name) => otherClasses.add(name))
+      );
+
+      const uniqueClass = (classSets[type] || []).find(
+        (name) => !otherClasses.has(name)
+      );
+      if (uniqueClass) {
+        config.detectOptionClass = uniqueClass;
+        return;
+      }
+
+      const attrs = attrSets[type] || {};
+      for (const [name, value] of Object.entries(attrs)) {
+        const usedByOthers = otherTypes.some(
+          (key) => (attrSets[key] || {})[name] === value
+        );
+        if (!usedByOthers) {
+          config.detectOptionAttribute = { name, value };
+          return;
+        }
+      }
+    });
+  }
+
+  // 没有任何识别方式的配置会让扫描器误判，直接移除
+  function pruneUndetectableTypes(types) {
+    Object.keys(types).forEach((type) => {
       const config = types[type];
       if (
         !config.optionInput &&
         !config.inputs &&
         !config.detectClass &&
         !config.detectAttribute &&
+        !config.detectOptionClass &&
+        !config.detectOptionAttribute &&
         !config.detectText
       ) {
         delete types[type];
@@ -714,6 +869,7 @@
   class SiteMemory {
     constructor() {
       this.STORAGE_KEY = STORAGE_KEY;
+      this.lastLearnError = "";
     }
 
     async _read() {
@@ -868,48 +1024,74 @@
      * 从当前页面的 AI 识别结果学习结构模板
      * @returns {Promise<Object|null>} 保存后的模板（失败返回 null）
      */
+    _fail(reason) {
+      this.lastLearnError = reason;
+      console.log("[SiteMemory] 跳过学习:", reason);
+      return null;
+    }
+
     async learnFromQuestions({ questions, url, origin } = {}) {
-      if (!Array.isArray(questions) || !questions.length) return null;
+      this.lastLearnError = "";
+
+      if (!Array.isArray(questions) || !questions.length) {
+        return this._fail("没有识别到题目");
+      }
 
       const host = hostOf(url);
-      if (!host) return null;
+      if (!host) return this._fail("无法识别当前域名");
 
       const items = [];
+      let unlocatable = 0;
       questions.forEach((question) => {
-        if (!question || !question.type) return;
+        if (!question || !question.type) {
+          unlocatable += 1;
+          return;
+        }
         const elements = collectQuestionElements(question);
-        if (!elements.length) return;
+        if (!elements.length) {
+          unlocatable += 1;
+          return;
+        }
         const container = findContainer(elements, question.text);
-        if (!container) return;
+        if (!container) {
+          unlocatable += 1;
+          return;
+        }
         if (container === document.body || container === document.documentElement) {
+          unlocatable += 1;
           return;
         }
         items.push({ question, container, elements });
       });
 
-      if (!items.length) return null;
+      if (!items.length) {
+        return this._fail(
+          unlocatable
+            ? "AI 返回的题目选择器在页面上无法定位（可能选择器失效或题目不在主文档）"
+            : "没有可学习的题目元素"
+        );
+      }
 
       const containers = uniqueElements(items.map((item) => item.container));
-      if (!containers.length) return null;
+      if (!containers.length) return this._fail("无法定位题目容器");
 
       const questionContainer = chooseContainerSelector(containers);
       if (!questionContainer) {
-        console.log("[SiteMemory] 无法生成稳定的题目容器选择器，跳过学习");
-        return null;
+        return this._fail(
+          "无法生成稳定的题目容器选择器（容器缺少稳定的 class/属性，或匹配范围过宽）"
+        );
       }
 
       const titleElements = items.map((item) =>
         findTitleElement(item.container, item.question.text)
       );
       if (titleElements.some((element) => !element)) {
-        console.log("[SiteMemory] 未能定位全部题干元素，跳过学习");
-        return null;
+        return this._fail("无法在题目容器内定位题干文本");
       }
 
       const titleSelector = deriveChildSelector(containers, titleElements);
       if (!titleSelector) {
-        console.log("[SiteMemory] 无法生成题干选择器，跳过学习");
-        return null;
+        return this._fail("无法生成稳定的题干选择器");
       }
 
       const groups = { single: [], multiple: [], fill: [] };
@@ -927,7 +1109,10 @@
           questionContainer,
           titleSelector
         );
-        if (!config) return;
+        if (!config) {
+          this.lastLearnError = `无法推导${type === "single" ? "单选" : "多选"}题的选项结构`;
+          return;
+        }
         types[type] = config;
         typeContainers[type] = groups[type].map((item) => item.container);
       });
@@ -941,6 +1126,8 @@
         if (config) {
           types.fill = config;
           typeContainers.fill = groups.fill.map((item) => item.container);
+        } else {
+          this.lastLearnError = "无法推导填空题的输入框结构";
         }
       } else if (types.single || types.multiple) {
         // 首页没有填空题时也补一个通用填空题配置：填空题的输入框特征明显，
@@ -967,10 +1154,13 @@
       }
 
       applyTypeDistinguishers(types, typeContainers);
+      applyOptionDistinguishers(types, groups);
+      pruneUndetectableTypes(types);
 
       if (!Object.keys(types).length) {
-        console.log("[SiteMemory] 没有可用的题型结构，跳过学习");
-        return null;
+        return this._fail(
+          "没有可用于区分题型的结构特征（纯点击选项且没有稳定的 class/角色/文案）"
+        );
       }
 
       const template = {
@@ -995,8 +1185,10 @@
 
       const validation = this.validateTemplate(template, questions.length);
       if (!validation.ok) {
-        console.log("[SiteMemory] 学习模板自检未通过，跳过保存:", validation.reason);
-        return null;
+        const detail = this.lastLearnError
+          ? `${validation.reason}；${this.lastLearnError}`
+          : validation.reason;
+        return this._fail(`学习模板自检未通过：${detail}`);
       }
 
       const saved = await this.saveTemplate(host, template);
@@ -1018,6 +1210,8 @@
         inputs: value && value.inputs,
         detectClass: value && value.detectClass,
         detectAttribute: value && value.detectAttribute,
+        detectOptionClass: value && value.detectOptionClass,
+        detectOptionAttribute: value && value.detectOptionAttribute,
         detectText: value && value.detectText,
       });
       return JSON.stringify({
@@ -1045,7 +1239,15 @@
         return { ok: false, reason: "扫描不到题目" };
       }
 
-      const minimum = Math.max(1, Math.floor(expectedCount * 0.6));
+      // 有输入控件却没解析出来，说明模板漏了题型，宁可重新分析
+      if (result.missed > 0) {
+        return {
+          ok: false,
+          reason: `有 ${result.missed} 个含可作答控件的容器未被解析`,
+        };
+      }
+
+      const minimum = Math.max(1, Math.ceil(expectedCount * 0.9));
       if (result.count < minimum) {
         return {
           ok: false,

@@ -171,6 +171,31 @@
             typeSelectors = config;
             break;
           }
+          if (
+            (config.detectOptionClass || config.detectOptionAttribute) &&
+            config.optionItem
+          ) {
+            const optionEl = safeQuery(element, config.optionItem);
+            if (
+              optionEl &&
+              config.detectOptionClass &&
+              optionEl.classList.contains(config.detectOptionClass)
+            ) {
+              questionType = type;
+              typeSelectors = config;
+              break;
+            }
+            if (
+              optionEl &&
+              config.detectOptionAttribute &&
+              optionEl.getAttribute(config.detectOptionAttribute.name) ===
+                config.detectOptionAttribute.value
+            ) {
+              questionType = type;
+              typeSelectors = config;
+              break;
+            }
+          }
           if (config.detectText) {
             const titleEl = safeQuery(element, config.title);
             const text = titleEl
