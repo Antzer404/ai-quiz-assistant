@@ -71,6 +71,13 @@ async function handleMessage(request, sender) {
     case "testConnection":
       return await testConnection(request.config);
 
+    case "getFrameId":
+      return {
+        success: true,
+        frameId: typeof sender.frameId === "number" ? sender.frameId : 0,
+        tabId: getTabId(request, sender),
+      };
+
     case "sessionStart":
       return await startSession(request, sender);
 
@@ -469,6 +476,13 @@ async function startSession(request, sender) {
 
   const state = {
     tabId,
+    frameId:
+      typeof request.frameId === "number"
+        ? request.frameId
+        : typeof sender.frameId === "number"
+        ? sender.frameId
+        : 0,
+    frameUrl: request.frameUrl || "",
     running: true,
     stopRequested: false,
     phase: "starting",

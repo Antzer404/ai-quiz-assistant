@@ -57,6 +57,15 @@ const prefSubmitText = document.getElementById("prefSubmitText");
 const prefWebSearch = document.getElementById("prefWebSearch");
 const prefWebSearchProvider = document.getElementById("prefWebSearchProvider");
 const prefReasoningEffort = document.getElementById("prefReasoningEffort");
+const prefManualQuestionSelector = document.getElementById(
+  "prefManualQuestionSelector"
+);
+const manualSelectorHost = document.getElementById("manualSelectorHost");
+const manualSelectorStatus = document.getElementById("manualSelectorStatus");
+const testManualSelectorBtn = document.getElementById("testManualSelectorBtn");
+const clearCurrentSiteMemoryBtn = document.getElementById(
+  "clearCurrentSiteMemoryBtn"
+);
 const siteMemoryInfo = document.getElementById("siteMemoryInfo");
 const clearSiteMemoryBtn = document.getElementById("clearSiteMemoryBtn");
 
@@ -69,6 +78,7 @@ const clearLogBtn = document.getElementById("clearLog");
 let isRunning = false;
 let hasScanned = false;
 let prefs = null;
+let currentTabHost = "";
 
 const STORAGE_KEYS = {
   models: "aiModels",
@@ -83,23 +93,25 @@ document.addEventListener("DOMContentLoaded", async () => {
   // Check active session
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   if (tabs[0]) {
-    chrome.tabs.sendMessage(tabs[0].id, { action: "getStatus" }, (response) => {
-      if (chrome.runtime.lastError) return;
-
-      if (response) {
-        questionCount.textContent = response.questionCount || 0;
-        answeredCount.textContent = response.answeredCount || 0;
-
-        if (response.isRunning) {
-          setRunningState(true);
-          addLog("info", "检测到正在运行的任务");
-        } else if (response.questionCount > 0) {
-          hasScanned = true;
-          startBtn.disabled = false;
-          addLog("info", "检测到已扫描题目，可以开始");
-        }
-      }
+    const manualSelector = getManualSelectorForUrl(tabs[0].url, prefs);
+    const frameId = await pickQuestionFrame(tabs[0].id, manualSelector);
+    const response = await sendToFrame(tabs[0].id, frameId, {
+      action: "getStatus",
     });
+
+    if (response && !response.error) {
+      questionCount.textContent = response.questionCount || 0;
+      answeredCount.textContent = response.answeredCount || 0;
+
+      if (response.isRunning) {
+        setRunningState(true);
+        addLog("info", "检测到正在运行的任务");
+      } else if (response.questionCount > 0) {
+        hasScanned = true;
+        startBtn.disabled = false;
+        addLog("info", "检测到已扫描题目，可以开始");
+      }
+    }
   }
 });
 
@@ -143,6 +155,7 @@ closeEditBackdrop.addEventListener("click", closeEditModal);
 
 // 答题设置
 openPrefsBtn.addEventListener("click", async () => {
+  await resolveCurrentTabHost();
   await loadPrefs();
   await renderSiteMemoryInfo();
   prefsModal.classList.add("open");
@@ -518,9 +531,51 @@ function showEditStatus(type, message) {
 
 // --- 答题设置 ---
 
+async function resolveCurrentTabHost() {
+  currentTabHost = "";
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const url = tabs[0] && tabs[0].url;
+    if (url) currentTabHost = new URL(url).hostname.toLowerCase();
+  } catch (error) {
+    console.warn("[popup] 读取当前站点失败:", error);
+  }
+
+  if (!manualSelectorHost) return;
+  manualSelectorHost.textContent = currentTabHost
+    ? `当前站点：${currentTabHost}`
+    : "当前站点：无法读取（请切换到普通网页后重试）";
+}
+
 async function loadPrefs() {
   prefs = await window.QuizSettings.get();
   renderPrefs();
+}
+
+function renderManualSelector() {
+  const selectors =
+    (prefs && prefs.manualQuestionSelectors) || {};
+  const selector = currentTabHost ? selectors[currentTabHost] || "" : "";
+
+  if (prefManualQuestionSelector) {
+    prefManualQuestionSelector.value = selector;
+    prefManualQuestionSelector.disabled = !currentTabHost;
+  }
+  if (testManualSelectorBtn) testManualSelectorBtn.disabled = !currentTabHost;
+  if (clearCurrentSiteMemoryBtn) {
+    clearCurrentSiteMemoryBtn.disabled = !currentTabHost;
+  }
+}
+
+function showManualSelectorStatus(type, message) {
+  if (!manualSelectorStatus) return;
+  manualSelectorStatus.textContent = message;
+  manualSelectorStatus.className = `field-hint manual-selector-status ${type}`;
+  clearTimeout(showManualSelectorStatus._timer);
+  showManualSelectorStatus._timer = setTimeout(() => {
+    manualSelectorStatus.textContent = "";
+    manualSelectorStatus.className = "field-hint";
+  }, 8000);
 }
 
 function renderPrefs() {
@@ -543,6 +598,7 @@ function renderPrefs() {
   prefWebSearchProvider.value = prefs.webSearchProvider || "auto";
   prefReasoningEffort.value = prefs.reasoningEffort || "";
   updateWebSearchControls();
+  renderManualSelector();
 }
 
 function updateWebSearchControls() {
@@ -552,6 +608,18 @@ function updateWebSearchControls() {
 prefWebSearch.addEventListener("change", updateWebSearchControls);
 
 function collectPrefs() {
+  const manualQuestionSelectors = {
+    ...((prefs && prefs.manualQuestionSelectors) || {}),
+  };
+  if (currentTabHost) {
+    const selector = prefManualQuestionSelector.value.trim();
+    if (selector) {
+      manualQuestionSelectors[currentTabHost] = selector;
+    } else {
+      delete manualQuestionSelectors[currentTabHost];
+    }
+  }
+
   return {
     autoNext: prefAutoNext.checked,
     nextMode: prefNextMode.value,
@@ -570,8 +638,91 @@ function collectPrefs() {
     webSearch: prefWebSearch.checked,
     webSearchProvider: prefWebSearchProvider.value,
     reasoningEffort: prefReasoningEffort.value,
+    manualQuestionSelectors,
   };
 }
+
+testManualSelectorBtn.addEventListener("click", async () => {
+  if (!currentTabHost) {
+    showManualSelectorStatus("error", "请先切换到有题目的网页");
+    return;
+  }
+  const selector = prefManualQuestionSelector.value.trim();
+  if (!selector) {
+    showManualSelectorStatus("error", "请先填写题目区域选择器");
+    return;
+  }
+
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs[0];
+  if (!tab) {
+    showManualSelectorStatus("error", "无法获取当前标签页");
+    return;
+  }
+
+  testManualSelectorBtn.disabled = true;
+  testManualSelectorBtn.textContent = "测试中...";
+
+  try {
+    const frames = await probeFrames(tab.id, selector);
+    const invalid = frames.some((frame) => frame.manualError);
+    const matches = frames.filter((frame) => frame.manual > 0);
+
+    if (invalid) {
+      showManualSelectorStatus("error", "选择器语法无效，请重新复制");
+    } else if (matches.length) {
+      const detail = matches
+        .map(
+          (frame) =>
+            `frame ${frame.frameId}${
+              frame.isTop ? "（顶层）" : "（iframe）"
+            }：${frame.manual} 个`
+        )
+        .join("；");
+      showManualSelectorStatus("success", `选择器有效，${detail}`);
+    } else {
+      const iframeCount = frames.filter((frame) => !frame.isTop).length;
+      showManualSelectorStatus(
+        "warning",
+        iframeCount
+          ? `未匹配到元素；已检查 ${iframeCount} 个 iframe，请确认复制的选择器属于哪个 frame`
+          : "未匹配到元素，请检查选择器是否正确"
+      );
+    }
+  } catch (error) {
+    showManualSelectorStatus("error", `测试失败：${error.message}`);
+  } finally {
+    testManualSelectorBtn.disabled = false;
+    testManualSelectorBtn.textContent = "测试选择器";
+  }
+});
+
+clearCurrentSiteMemoryBtn.addEventListener("click", async () => {
+  if (!currentTabHost) {
+    showManualSelectorStatus("error", "请先切换到有题目的网页");
+    return;
+  }
+
+  const confirmed = confirm(
+    `确定要清除 ${currentTabHost} 的本地结构记忆吗？下次会重新用 AI 分析页面结构。`
+  );
+  if (!confirmed) return;
+
+  try {
+    const data = await chrome.storage.local.get("siteStructureMemory");
+    const store = data.siteStructureMemory;
+    if (!store || !store.sites || !store.sites[currentTabHost]) {
+      showManualSelectorStatus("warning", "当前站点没有本地结构记忆");
+      return;
+    }
+    delete store.sites[currentTabHost];
+    await chrome.storage.local.set({ siteStructureMemory: store });
+    await renderSiteMemoryInfo();
+    showManualSelectorStatus("success", "已清除当前站点的本地结构记忆");
+  } catch (error) {
+    showManualSelectorStatus("error", `清除失败：${error.message}`);
+  }
+});
 
 async function renderSiteMemoryInfo() {
   if (!siteMemoryInfo) return;
@@ -649,6 +800,140 @@ async function getRunSettings() {
   return prefs;
 }
 
+// --- Frame 路由 ---
+// 题目可能位于 iframe 中：先探测每个 frame，再把扫描/开始/状态请求
+// 精确发送到真正包含题目的 frame。
+
+const activeFrameIds = new Map();
+
+function hostFromUrl(url) {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch (_) {
+    return "";
+  }
+}
+
+function getManualSelectorForUrl(url, settingsLike) {
+  const host = hostFromUrl(url);
+  const map = (settingsLike && settingsLike.manualQuestionSelectors) || {};
+  return host ? map[host] || "" : "";
+}
+
+async function probeFrames(tabId, manualSelector = "") {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: (selector) => {
+        let manualError = false;
+        const count = (value) => {
+          try {
+            return document.querySelectorAll(value).length;
+          } catch (_) {
+            return 0;
+          }
+        };
+        const countManual = (value) => {
+          try {
+            return document.querySelectorAll(value).length;
+          } catch (_) {
+            manualError = true;
+            return 0;
+          }
+        };
+        const manual = selector ? countManual(selector) : 0;
+        return {
+          isTop: window === window.top,
+          href: location.href,
+          manualError,
+          manual,
+          radio: count('input[type="radio"], input[type="checkbox"]'),
+          fill: count(
+            'input[type="text"], input[type="number"], textarea, [contenteditable="true"]'
+          ),
+          questionBlocks: count(
+            '.question, .exam-question, .topic, .subject, .problem, [class*="question" i]'
+          ),
+        };
+      },
+      args: [manualSelector],
+    });
+
+    return (results || [])
+      .filter((item) => item && item.result)
+      .map((item) => ({ frameId: item.frameId, ...item.result }));
+  } catch (error) {
+    console.warn("[popup] 探测 frame 失败:", error);
+    return [];
+  }
+}
+
+function scoreFrame(frame) {
+  if (!frame) return 0;
+  let score = 0;
+  if (frame.manual > 0) score += 10000 + Math.min(frame.manual, 50) * 10;
+  score += Math.min(frame.radio || 0, 50) * 8;
+  score += Math.min(frame.fill || 0, 20) * 4;
+  score += Math.min(frame.questionBlocks || 0, 20) * 2;
+  return score;
+}
+
+async function pickQuestionFrame(tabId, manualSelector = "") {
+  const cached = activeFrameIds.get(tabId);
+  const frames = await probeFrames(tabId, manualSelector);
+  if (!frames.length) {
+    const frameId = typeof cached === "number" ? cached : 0;
+    activeFrameIds.set(tabId, frameId);
+    return frameId;
+  }
+
+  frames.sort(
+    (a, b) =>
+      scoreFrame(b) - scoreFrame(a) ||
+      (b.isTop ? 1 : 0) - (a.isTop ? 1 : 0)
+  );
+
+  const best = frames[0];
+  // 探测不到明显题目特征时，沿用上次扫描成功的 frame（纯 div 点击题可能没有特征）
+  const frameId =
+    best && scoreFrame(best) > 0
+      ? best.frameId
+      : typeof cached === "number"
+      ? cached
+      : 0;
+  activeFrameIds.set(tabId, frameId);
+  console.log(
+    "[popup] frame 探测:",
+    frames.map((frame) => ({
+      frameId: frame.frameId,
+      top: frame.isTop,
+      manual: frame.manual,
+      radio: frame.radio,
+      fill: frame.fill,
+      blocks: frame.questionBlocks,
+    })),
+    "->",
+    frameId
+  );
+  return frameId;
+}
+
+function sendToFrame(tabId, frameId, message) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, message, { frameId }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve({ error: chrome.runtime.lastError.message });
+      } else {
+        resolve(response || {});
+      }
+    });
+  });
+}
+
+async function wait(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // --- Action Logic ---
 
 // 确保 content script 已注入到目标页面
@@ -693,13 +978,13 @@ async function injectContentScript(tabId) {
 
     // 注入 CSS
     await chrome.scripting.insertCSS({
-      target: { tabId },
+      target: { tabId, allFrames: true },
       files: ["content.css"],
     });
 
     // 按顺序注入 JS 模块
     await chrome.scripting.executeScript({
-      target: { tabId },
+      target: { tabId, allFrames: true },
       files: [
         "modules/settings.js",
         "modules/navigation.js",
@@ -774,30 +1059,50 @@ scanBtn.addEventListener("click", async () => {
     return;
   }
 
-  chrome.tabs.sendMessage(
-    tab.id,
-    { action: "scan", config, settings: runSettings },
-    (response) => {
-    scanBtn.disabled = false;
+  // 题目可能在 iframe 中：探测并只向包含题目的 frame 发送扫描请求
+  const manualSelector = getManualSelectorForUrl(tab.url, runSettings);
+  let frameId = await pickQuestionFrame(tab.id, manualSelector);
+  if (frameId !== 0) {
+    addLog("info", `题目可能位于 iframe（frameId: ${frameId}），正在该 frame 中扫描`);
+  }
 
-    if (chrome.runtime.lastError) {
-      addLog("error", "连接失败，请刷新页面后重试");
-      updateStatus("error", "连接失败");
-      return;
-    }
+  let response = await sendToFrame(tab.id, frameId, {
+    action: "scan",
+    config,
+    settings: runSettings,
+  });
 
-      if (response && response.success) {
-        questionCount.textContent = response.count;
-        hasScanned = true;
-        startBtn.disabled = false;
-        addLog("success", `扫描完成: ${response.count} 题`);
-        updateStatus("ready", "扫描完成");
-      } else {
-        addLog("warning", (response && response.message) || "未发现题目");
-        updateStatus("ready", "未发现题目");
-      }
-    }
-  );
+  if (response && response.error) {
+    addLog("warning", "目标 frame 尚未就绪，尝试重新注入后重试...");
+    await injectContentScript(tab.id);
+    await wait(300);
+    frameId = await pickQuestionFrame(tab.id, manualSelector);
+    response = await sendToFrame(tab.id, frameId, {
+      action: "scan",
+      config,
+      settings: runSettings,
+    });
+  }
+
+  scanBtn.disabled = false;
+
+  if (!response || response.error) {
+    addLog("error", "连接失败，请刷新页面后重试");
+    updateStatus("error", "连接失败");
+    return;
+  }
+
+  if (response.success) {
+    activeFrameIds.set(tab.id, frameId);
+    questionCount.textContent = response.count;
+    hasScanned = true;
+    startBtn.disabled = false;
+    addLog("success", `扫描完成: ${response.count} 题`);
+    updateStatus("ready", "扫描完成");
+  } else {
+    addLog("warning", response.message || "未发现题目");
+    updateStatus("ready", "未发现题目");
+  }
 });
 
 // 2. Start/Pause Toggle
@@ -819,6 +1124,7 @@ startBtn.addEventListener("click", async () => {
     // 即使 content script 正在页面跳转，也由后台清掉会话，防止新页面自动恢复
     chrome.runtime.sendMessage({ action: "sessionStop", tabId: tab.id });
     chrome.runtime.sendMessage({ action: "sessionClear", tabId: tab.id });
+    activeFrameIds.delete(tab.id);
     chrome.tabs.sendMessage(tab.id, { action: "stop" });
   } else {
     // 检查是否是系统页面
@@ -854,28 +1160,38 @@ startBtn.addEventListener("click", async () => {
       model: activeModel.model,
     };
     const runSettings = await getRunSettings();
+    const manualSelector = getManualSelectorForUrl(tab.url, runSettings);
+    let frameId = await pickQuestionFrame(tab.id, manualSelector);
 
     setRunningState(true);
     addLog("info", "🚀 开始自动答题");
-    chrome.tabs.sendMessage(
-      tab.id,
-      {
+    let response = await sendToFrame(tab.id, frameId, {
+      action: "start",
+      config,
+      settings: runSettings,
+    });
+
+    if (response && response.error) {
+      addLog("warning", "目标 frame 尚未就绪，尝试重新注入后重试...");
+      await injectContentScript(tab.id);
+      await wait(300);
+      frameId = await pickQuestionFrame(tab.id, manualSelector);
+      response = await sendToFrame(tab.id, frameId, {
         action: "start",
         config,
         settings: runSettings,
-      },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          setRunningState(false);
-          addLog("error", "连接中断，请刷新页面后重试");
-          return;
-        }
-        if (response && response.success === false) {
-          setRunningState(false);
-          addLog("error", response.error || "启动失败");
-        }
-      }
-    );
+      });
+    }
+
+    if (!response || response.error) {
+      setRunningState(false);
+      addLog("error", "连接中断，请刷新页面后重试");
+      return;
+    }
+    if (response.success === false) {
+      setRunningState(false);
+      addLog("error", response.error || "启动失败");
+    }
   }
 });
 

@@ -605,6 +605,12 @@ body {
   min-width: 0;
 }
 
+.form-row .btn {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+}
+
 .checkbox-row {
   display: flex;
   align-items: flex-start;

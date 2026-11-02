@@ -34,6 +34,7 @@
         submitText: ["提交", "交卷", "完成", "Submit"],
         nextSelector: "",
         submitSelector: "",
+        manualQuestionSelectors: {},
         resumeWaitMs: 2500,
         webSearch: false,
         webSearchProvider: "auto",
@@ -42,6 +43,8 @@
       };
   let sessionState = null;
   let lastPage = 1;
+  let myFrameId = 0;
+  let frameIdResolved = false;
 
   // Question selectors for common exam platforms
   const QUESTION_SELECTORS = [
@@ -117,6 +120,10 @@
         startAnswering();
         sendResponse({ success: true });
         return true;
+
+      case "testSelector":
+        sendResponse(testManualSelector(message.selector));
+        break;
 
       case "stop":
         stopAnswering();
@@ -230,7 +237,7 @@
       const aiResult = await analyzePageWithAI();
       if (aiResult && aiResult.success) {
         aiDetectedSelectors = aiResult.selectors;
-        const count = scanWithAISelectors(aiResult);
+        const count = scanWithAISelectors(aiResult, aiResult.manualRegion);
         if (count > 0) {
           updateStats();
           const learned = await rememberPageStructure();
@@ -261,7 +268,7 @@
   async function scanWithSiteMemory() {
     if (!window.siteMemory || !window.EnhancedScanner) return null;
 
-    const host = location.hostname;
+    const host = getPageHost();
     if (!host) return null;
 
     let entries = [];
@@ -312,7 +319,8 @@
       const template = await window.siteMemory.learnFromQuestions({
         questions,
         url: location.href,
-        origin: location.origin,
+        origin: getTopPageOrigin(),
+        host: getPageHost(),
       });
       if (template) return { ok: true, reason: "" };
       return {
@@ -624,6 +632,152 @@
     return html;
   }
 
+  // -------------------------------------------------------------------------
+  // 手动指定题目区域（F12 复制选择器）
+  // -------------------------------------------------------------------------
+
+  const MANUAL_REGION_MAX_ELEMENTS = 50;
+  const MANUAL_REGION_TOTAL_LIMIT = 50000;
+
+  // 支持 CSS 选择器；以 / 或 (// 开头时按 XPath 处理
+  function queryManualRegionElements(selector) {
+    const value = String(selector || "").trim();
+    if (!value) return [];
+
+    if (value.startsWith("/") || /^\(\s*\//.test(value)) {
+      const result = document.evaluate(
+        value,
+        document,
+        null,
+        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,
+        null
+      );
+      const elements = [];
+      const max = Math.min(result.snapshotLength, 500);
+      for (let i = 0; i < max; i += 1) {
+        const node = result.snapshotItem(i);
+        if (node && node.nodeType === Node.ELEMENT_NODE) elements.push(node);
+      }
+      return elements;
+    }
+
+    return Array.from(document.querySelectorAll(value)).slice(0, 500);
+  }
+
+  // 只保留最外层区域，避免嵌套元素重复发送
+  function pickTopLevelRegions(elements) {
+    const valid = (elements || []).filter(
+      (el) =>
+        el &&
+        el.isConnected &&
+        el !== document.body &&
+        el !== document.documentElement
+    );
+    return valid
+      .filter((el) => !valid.some((other) => other !== el && other.contains(el)))
+      .slice(0, MANUAL_REGION_MAX_ELEMENTS);
+  }
+
+  function getManualQuestionRegion() {
+    const selectors = (settings && settings.manualQuestionSelectors) || {};
+    let selector = "";
+    for (const host of getHostCandidates()) {
+      if (selectors[host]) {
+        selector = selectors[host];
+        break;
+      }
+    }
+    if (!selector) return null;
+
+    let matched = [];
+    try {
+      matched = queryManualRegionElements(selector);
+    } catch (error) {
+      console.warn("[AI答题助手] 手动题目区域选择器无效:", selector, error);
+      return { selector, regions: [], error: "选择器无效" };
+    }
+
+    return { selector, regions: pickTopLevelRegions(matched), error: "" };
+  }
+
+  function buildManualRegionPayload(manualRegion) {
+    if (!manualRegion || !manualRegion.regions.length) return null;
+
+    const parts = [];
+    let used = 0;
+
+    manualRegion.regions.forEach((region, index) => {
+      if (used >= MANUAL_REGION_TOTAL_LIMIT) return;
+
+      const clone = region.cloneNode(true);
+      simplifyElementAttributes(clone);
+      let html = clone.outerHTML || "";
+      html = html.replace(/\s+/g, " ").replace(/>\s+</g, "><");
+
+      const text = cleanText(region.textContent || "").substring(0, 500);
+      const header = `【用户指定区域${index + 1}】\n文本摘要：${text}\nHTML：`;
+      const remaining = MANUAL_REGION_TOTAL_LIMIT - used - header.length;
+      if (remaining <= 200) return;
+
+      if (html.length > remaining) {
+        html = html.substring(0, remaining) + "... [内容已截断]";
+      }
+
+      const block = header + html;
+      parts.push(block);
+      used += block.length;
+    });
+
+    if (!parts.length) return null;
+    return `用户手动指定了题目区域（选择器：${manualRegion.selector}，匹配 ${manualRegion.regions.length} 个区域）。请只在该区域内容中识别题目。\n\n${parts.join(
+      "\n\n"
+    )}`;
+  }
+
+  // 测试选择器：只做 DOM 匹配，不发送 AI 请求
+  function testManualSelector(selector) {
+    const value = String(selector || "").trim();
+    if (!value) {
+      return { success: false, count: 0, message: "请先填写选择器" };
+    }
+
+    let matched = [];
+    try {
+      matched = queryManualRegionElements(value);
+    } catch (error) {
+      return {
+        success: false,
+        count: 0,
+        message: `选择器无效：${error.message}`,
+      };
+    }
+
+    const regions = pickTopLevelRegions(matched);
+    if (!regions.length) {
+      const iframeCount = document.querySelectorAll("iframe").length;
+      return {
+        success: false,
+        count: 0,
+        message: iframeCount
+          ? `未匹配到元素；页面有 ${iframeCount} 个 iframe，题目可能在子框架中`
+          : "未匹配到元素，请检查选择器是否正确",
+      };
+    }
+
+    const first = regions[0];
+    const classes = Array.from(first.classList || [])
+      .slice(0, 3)
+      .join(".");
+    const textLength = cleanText(first.textContent || "").length;
+    return {
+      success: true,
+      count: regions.length,
+      message: `匹配到 ${regions.length} 个区域；首个为 <${first.tagName.toLowerCase()}${
+        first.id ? `#${first.id}` : ""
+      }${classes ? `.${classes}` : ""}>，约 ${textLength} 字`,
+    };
+  }
+
   // 根据页面内容尝试提取候选题目块，显著减少发送给AI的数据量
   function getCandidateQuestionBlocks(maxBlocks = 40) {
     const candidateSet = new Set();
@@ -674,8 +828,36 @@
       .filter((block) => block.text);
   }
 
-  // 构建AI分析所需的内容，如果候选块为空则回退到整页HTML
+  // 构建AI分析所需的内容：手动区域 > 候选块 > 整页HTML
   function buildAIAnalysisPayload() {
+    const manualRegion = getManualQuestionRegion();
+    if (manualRegion) {
+      if (manualRegion.regions.length) {
+        const manualPayload = buildManualRegionPayload(manualRegion);
+        if (manualPayload) {
+          sendLog(
+            "info",
+            `使用手动指定题目区域：${manualRegion.selector}，匹配 ${manualRegion.regions.length} 个元素`
+          );
+          return {
+            payload: manualPayload,
+            source: "manualRegion",
+            manualRegion,
+          };
+        }
+      } else {
+        const iframeCount = document.querySelectorAll("iframe").length;
+        sendLog(
+          "warning",
+          `手动题目区域未匹配到元素：${manualRegion.selector}${
+            iframeCount
+              ? `；页面有 ${iframeCount} 个 iframe，题目可能在子框架中`
+              : ""
+          }`
+        );
+      }
+    }
+
     const blocks = getCandidateQuestionBlocks();
     if (blocks.length > 0) {
       const formatted = blocks
@@ -700,11 +882,29 @@
 
   // 使用AI分析页面结构（只识别题目，不返回答案）
   async function analyzePageWithAI() {
-    const { payload, source } = buildAIAnalysisPayload();
-    const contentIntro =
-      source === "candidateBlocks"
-        ? "本次提供的是经过前端筛选的疑似题目块，请基于这些块识别题目结构。"
-        : "未找到足够的候选题目块，以下为整页精简HTML。";
+    const { payload, source, manualRegion } = buildAIAnalysisPayload();
+    const isManualRegion = source === "manualRegion";
+    const contentIntro = isManualRegion
+      ? "本次提供的是用户手动指定的题目区域 HTML，请只在该区域内识别题目结构，不要识别区域外的内容。"
+      : source === "candidateBlocks"
+      ? "本次提供的是经过前端筛选的疑似题目块，请基于这些块识别题目结构。"
+      : "未找到足够的候选题目块，以下为整页精简HTML。";
+
+    const selectorRule = isManualRegion
+      ? `3. selector: 在对应题目容器内可定位的 CSS 选择器即可（相对选择器）
+   - 优先使用稳定的 class，例如 .option-item:nth-child(2)
+   - 对于radio/checkbox，选择器应指向input元素本身
+   - 对于可点击的div/label，选择器应指向该可点击元素`
+      : `3. selector: 必须是可以直接用document.querySelector()定位到的精确CSS选择器
+   - 优先使用id选择器: #elementId
+   - 或使用class+nth-child: .option-item:nth-child(2)
+   - 或使用属性选择器: input[value="B"], input[name="q1"][value="2"]
+   - 对于radio/checkbox，选择器应指向input元素本身
+   - 对于可点击的div/label，选择器应指向该可点击元素`;
+
+    const manualRule = isManualRegion
+      ? `6. 这是“手动指定区域”模式：请为每道题额外返回 "container" 字段，值为该题容器相对于用户指定区域的 CSS 选择器，这样即使多道题结构相同也不会串题。用户指定区域的选择器为：${manualRegion.selector}`
+      : "";
 
     const prompt = `分析以下HTML页面，识别所有题目的结构。
 
@@ -753,14 +953,10 @@
 重要说明：
 1. type: "single"单选题, "multiple"多选题, "fill"填空题
 2. text: 必须包含完整的题干内容，后续需要用这个文本去获取答案
-3. selector: 必须是可以直接用document.querySelector()定位到的精确CSS选择器
-   - 优先使用id选择器: #elementId
-   - 或使用class+nth-child: .option-item:nth-child(2)
-   - 或使用属性选择器: input[value="B"], input[name="q1"][value="2"]
-   - 对于radio/checkbox，选择器应指向input元素本身
-   - 对于可点击的div/label，选择器应指向该可点击元素
+${selectorRule}
 4. 仔细分析HTML结构，确保选择器准确无误
 5. 【不要返回答案】这一步只需要识别题目结构
+${manualRule}
 
 ${contentIntro}
 
@@ -778,14 +974,67 @@ ${payload}`;
     }
 
     try {
-      return parseAIResponse(response.data);
+      const parsed = parseAIResponse(response.data);
+      if (manualRegion) parsed.manualRegion = manualRegion;
+      return parsed;
     } catch (error) {
       throw new Error(`解析AI响应失败: ${error.message}`);
     }
   }
 
+  // 在指定作用域内解析选择器（选择器可以指向作用域元素本身）
+  function safeQuerySelectorIn(scope, selector) {
+    if (!scope || !selector) return null;
+    try {
+      if (scope.matches && scope.matches(selector)) return scope;
+      return scope.querySelector(selector);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // 手动区域模式下，先按 AI 返回的题目容器定位，再按题目序号兜底
+  function resolveQuestionRoot(manualRegion, containerSelector, questionIndex) {
+    if (!manualRegion || !manualRegion.regions.length) return null;
+    const indexed = manualRegion.regions[questionIndex] || null;
+
+    if (containerSelector) {
+      // 多区域时优先在第 index 个区域内找，避免同构题目全部串到第一题
+      if (indexed) {
+        const root = safeQuerySelectorIn(indexed, containerSelector);
+        if (root) return root;
+      }
+      for (const region of manualRegion.regions) {
+        if (region === indexed) continue;
+        const root = safeQuerySelectorIn(region, containerSelector);
+        if (root) return root;
+      }
+    }
+
+    if (manualRegion.regions.length === 1) return manualRegion.regions[0];
+    return indexed;
+  }
+
+  function locateRequirementElement(manualRegion, questionRoot, selector) {
+    if (!selector) return null;
+
+    if (questionRoot) {
+      const element = safeQuerySelectorIn(questionRoot, selector);
+      if (element) return element;
+    }
+
+    if (manualRegion) {
+      for (const region of manualRegion.regions) {
+        const element = safeQuerySelectorIn(region, selector);
+        if (element) return element;
+      }
+    }
+
+    return safeQuerySelector(selector);
+  }
+
   // 使用AI分析结果创建题目列表（不含答案，答案在答题阶段逐题获取）
-  function scanWithAISelectors(aiResult) {
+  function scanWithAISelectors(aiResult, manualRegion = null) {
     questions = [];
     answeredCount = 0;
 
@@ -793,8 +1042,15 @@ ${payload}`;
       return 0;
     }
 
+    let unresolved = 0;
+
     // 使用AI返回的题目结构数据（不含答案）
     aiResult.questions.forEach((q, index) => {
+      const questionRoot = resolveQuestionRoot(
+        manualRegion,
+        q.container,
+        index
+      );
       const question = {
         index,
         type: q.type || "single",
@@ -808,20 +1064,36 @@ ${payload}`;
 
       // 处理选项（单选/多选题）
       if (q.options && q.options.length > 0) {
-        question.options = q.options.map((opt) => ({
-          label: opt.label,
-          text: opt.text,
-          selector: opt.selector,
-          element: opt.selector ? safeQuerySelector(opt.selector) : null,
-        }));
+        question.options = q.options.map((opt) => {
+          const element = locateRequirementElement(
+            manualRegion,
+            questionRoot,
+            opt.selector
+          );
+          if (opt.selector && !element) unresolved += 1;
+          return {
+            label: opt.label,
+            text: opt.text,
+            selector: opt.selector,
+            element,
+          };
+        });
       }
 
       // 处理填空题输入框
       if (q.type === "fill" && q.inputs && q.inputs.length > 0) {
-        question.inputs = q.inputs.map((inp) => ({
-          selector: inp.selector,
-          element: inp.selector ? safeQuerySelector(inp.selector) : null,
-        }));
+        question.inputs = q.inputs.map((inp) => {
+          const element = locateRequirementElement(
+            manualRegion,
+            questionRoot,
+            inp.selector
+          );
+          if (inp.selector && !element) unresolved += 1;
+          return {
+            selector: inp.selector,
+            element,
+          };
+        });
       }
 
       questions.push(question);
@@ -830,6 +1102,13 @@ ${payload}`;
         question.text.substring(0, 50)
       );
     });
+
+    if (unresolved > 0) {
+      sendLog(
+        "warning",
+        `${unresolved} 个选项/输入框选择器未能定位，答题时可能失败；可检查手动题目区域是否准确`
+      );
+    }
 
     updateStats();
     return questions.length;
@@ -878,6 +1157,7 @@ ${payload}`;
       return;
     }
 
+    await resolveFrameId();
     isRunning = true;
     runFinished = false;
     totalAnswered = 0;
@@ -899,6 +1179,8 @@ ${payload}`;
       settings,
       startUrl: location.href,
       origin: location.origin,
+      frameId: myFrameId,
+      frameUrl: location.href,
       answeredTotal: 0,
     });
 
@@ -1224,12 +1506,27 @@ ${payload}`;
     sendComplete(Boolean(stopped));
   }
 
+  function shouldResumeInThisFrame(state) {
+    if (!state) return false;
+    const sessionInTop = typeof state.frameId !== "number" || state.frameId === 0;
+
+    if (window === window.top) return sessionInTop;
+    if (sessionInTop) return false;
+    if (state.frameId === myFrameId) return true;
+
+    // 整页刷新后 frameId 可能变化：同 URL 的子 frame 允许恢复
+    return Boolean(state.frameUrl && state.frameUrl === location.href);
+  }
+
   // 页面加载后自动恢复未完成的会话（分页整页刷新时使用）
   async function resumeRunIfNeeded() {
+    await resolveFrameId();
+
     const res = await bgSend({ action: "sessionGet" });
     const state = res && res.state;
 
     if (!state || !state.running || state.stopRequested) return;
+    if (!shouldResumeInThisFrame(state)) return;
     if (state.expiresAt && Date.now() > state.expiresAt) {
       await bgSend({ action: "sessionClear" });
       return;
@@ -1420,6 +1717,71 @@ ${payload}`;
         resolve({ success: false, error: error.message });
       }
     });
+  }
+
+  async function resolveFrameId() {
+    if (frameIdResolved) return myFrameId;
+    try {
+      const res = await bgSend({ action: "getFrameId" });
+      if (res && typeof res.frameId === "number") myFrameId = res.frameId;
+    } catch (_) {
+      /* ignore */
+    }
+    frameIdResolved = true;
+    return myFrameId;
+  }
+
+  function getTopPageOrigin() {
+    try {
+      const origins = location.ancestorOrigins;
+      // ancestorOrigins 从直接父级排到顶层，最后一项才是顶层页面
+      if (origins && origins.length) {
+        return origins[origins.length - 1] || location.origin;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    try {
+      if (window.top && window.top !== window && window.top.location) {
+        return window.top.location.origin;
+      }
+    } catch (_) {
+      /* cross-origin top */
+    }
+    return location.origin;
+  }
+
+  // 站点级配置和本地记忆统一使用顶层页面域名，避免 iframe 域名不一致
+  function getPageHost() {
+    try {
+      return new URL(getTopPageOrigin()).hostname.toLowerCase();
+    } catch (_) {
+      return String(location.hostname || "").toLowerCase();
+    }
+  }
+
+  // 手动区域配置可能按顶层域名保存；iframe 内需要逐级回退查找
+  function getHostCandidates() {
+    const hosts = [];
+    const add = (value) => {
+      const host = String(value || "").toLowerCase();
+      if (host && !hosts.includes(host)) hosts.push(host);
+    };
+
+    add(location.hostname);
+    try {
+      const origins = location.ancestorOrigins || [];
+      for (let i = 0; i < origins.length; i += 1) {
+        try {
+          add(new URL(origins[i]).hostname);
+        } catch (_) {
+          /* ignore invalid origin */
+        }
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    return hosts;
   }
 
   async function updateSession(patch) {

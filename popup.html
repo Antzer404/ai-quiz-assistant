@@ -232,6 +232,23 @@
           </div>
 
           <div class="settings-section">
+            <div class="settings-section-title">题目区域定位（高级）</div>
+            <div class="field-hint" id="manualSelectorHost">当前站点：读取中...</div>
+            <div class="form-group">
+              <label for="prefManualQuestionSelector">题目区域 CSS 选择器（仅当前站点）</label>
+              <input type="text" id="prefManualQuestionSelector" placeholder="例如 #exam-paper 或 .question-list">
+            </div>
+            <div class="field-hint">
+              自动识别不到题目时使用：F12 打开开发者工具，选中包含题目的元素 → 右键 → Copy → Copy selector，粘贴到这里。只在 AI 分析页面结构时作为输入区域生效；留空保存可删除当前站点配置。
+            </div>
+            <div class="form-row">
+              <button class="btn btn-outline" id="testManualSelectorBtn" type="button">测试选择器</button>
+              <button class="btn btn-outline" id="clearCurrentSiteMemoryBtn" type="button">清除当前站点记忆</button>
+            </div>
+            <div class="field-hint" id="manualSelectorStatus"></div>
+          </div>
+
+          <div class="settings-section">
             <div class="settings-section-title">AI 回答质量</div>
             <label class="checkbox-row">
               <input type="checkbox" id="prefWebSearch">

@@ -31,6 +31,10 @@
     nextSelector: "",
     submitSelector: "",
 
+    // 手动指定题目区域（按站点，仅用于 AI 结构分析的输入）
+    // { "example.com": "#exam-paper" }
+    manualQuestionSelectors: {},
+
     // 页面加载等待
     resumeWaitMs: 2500,
 
@@ -59,6 +63,23 @@
       return list.length ? list : fallback.slice();
     }
     return fallback.slice();
+  }
+
+  function normalizeManualSelectors(value) {
+    const out = {};
+    if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+
+    let count = 0;
+    for (const [rawHost, rawSelector] of Object.entries(value)) {
+      if (count >= 200) break;
+      const host = String(rawHost || "").trim().toLowerCase();
+      const selector = String(rawSelector || "").trim();
+      if (!host || !selector) continue;
+      if (host.length > 253 || selector.length > 1000) continue;
+      out[host] = selector;
+      count += 1;
+    }
+    return out;
   }
 
   function normalize(raw) {
@@ -105,6 +126,9 @@
       submitText: splitList(merged.submitText, DEFAULTS.submitText.split(",")),
       nextSelector: String(merged.nextSelector || "").trim(),
       submitSelector: String(merged.submitSelector || "").trim(),
+      manualQuestionSelectors: normalizeManualSelectors(
+        merged.manualQuestionSelectors
+      ),
       resumeWaitMs: clampInt(
         merged.resumeWaitMs,
         0,

@@ -1030,14 +1030,14 @@
       return null;
     }
 
-    async learnFromQuestions({ questions, url, origin } = {}) {
+    async learnFromQuestions({ questions, url, origin, host: hostOverride } = {}) {
       this.lastLearnError = "";
 
       if (!Array.isArray(questions) || !questions.length) {
         return this._fail("没有识别到题目");
       }
 
-      const host = hostOf(url);
+      const host = hostOverride || hostOf(url);
       if (!host) return this._fail("无法识别当前域名");
 
       const items = [];
